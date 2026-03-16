@@ -13,6 +13,12 @@
 
 如果你不熟悉这类项目，也没关系。按下面步骤做，目标就是“从零部署起来并能在手机上用”。
 
+## 界面预览
+
+下面这张图是 Windows 桌面控制工具的公开 README 预览图：
+
+![移动 Codex 控制台预览](docs/assets/mobile-codex-control-console.png)
+
 ## 它能做什么
 
 - 在手机浏览器中查看 Codex 项目和会话

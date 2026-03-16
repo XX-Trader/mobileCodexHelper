@@ -13,6 +13,12 @@ This project is built for a simple use case:
 
 If you are not familiar with this kind of setup, that is fine. This README is written as a practical deployment guide.
 
+## Interface preview
+
+The screenshot below shows the Windows desktop control tool:
+
+![Mobile Codex control console preview](docs/assets/mobile-codex-control-console.png)
+
 ## What it does
 
 - view Codex projects and sessions from a phone browser

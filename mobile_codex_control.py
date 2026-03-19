@@ -952,8 +952,12 @@ class ControlApp:
 
         self.root = tk.Tk()
         self.root.title(APP_TITLE)
-        self.root.geometry("1260x900")
-        self.root.minsize(1120, 800)
+        screen_width = self.root.winfo_screenwidth()
+        screen_height = self.root.winfo_screenheight()
+        window_width = max(840, min(1260, screen_width - 80))
+        window_height = max(620, min(900, screen_height - 120))
+        self.root.geometry(f"{window_width}x{window_height}")
+        self.root.minsize(840, 620)
         self.root.configure(bg="#eef3f8")
 
         self.status_text = tk.StringVar(value="就绪")
@@ -965,12 +969,16 @@ class ControlApp:
         self.pending_approval_items: list[dict[str, Any]] = []
         self.selected_approval_token: str | None = None
         self._busy = False
+        self._scroll_canvas: tk.Canvas | None = None
+        self._scroll_window: int | None = None
 
         self._build_ui()
         self.refresh_status()
 
     def _build_ui(self) -> None:
-        container = tk.Frame(self.root, bg="#eef3f8")
+        scroll_body = self._build_scrollable_root()
+
+        container = tk.Frame(scroll_body, bg="#eef3f8")
         container.pack(fill="both", expand=True, padx=14, pady=14)
 
         title = tk.Label(
@@ -1202,6 +1210,49 @@ class ControlApp:
         self.whitelist_text = self._build_text_panel(bottom, "设备白名单")
         self.requests_text = self._build_text_panel(bottom, "最近手机访问")
         self.diagnostics_text = self._build_text_panel(bottom, "诊断信息")
+
+    def _build_scrollable_root(self) -> tk.Frame:
+        canvas = tk.Canvas(self.root, bg="#eef3f8", highlightthickness=0, bd=0)
+        scrollbar = tk.Scrollbar(self.root, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=scrollbar.set)
+
+        scrollbar.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+
+        body = tk.Frame(canvas, bg="#eef3f8")
+        window_id = canvas.create_window((0, 0), window=body, anchor="nw")
+
+        body.bind("<Configure>", self._sync_root_scroll_region)
+        canvas.bind("<Configure>", self._resize_root_scroll_window)
+        self.root.bind_all("<MouseWheel>", self._handle_root_mousewheel, add="+")
+
+        self._scroll_canvas = canvas
+        self._scroll_window = window_id
+        return body
+
+    def _sync_root_scroll_region(self, _event: Any = None) -> None:
+        if self._scroll_canvas is None:
+            return
+
+        self._scroll_canvas.configure(scrollregion=self._scroll_canvas.bbox("all"))
+
+    def _resize_root_scroll_window(self, event: Any) -> None:
+        if self._scroll_canvas is None or self._scroll_window is None:
+            return
+
+        self._scroll_canvas.itemconfigure(self._scroll_window, width=event.width)
+
+    def _handle_root_mousewheel(self, event: Any) -> None:
+        if self._scroll_canvas is None:
+            return
+        if isinstance(event.widget, (tk.Text, tk.Listbox)):
+            return
+
+        delta = getattr(event, "delta", 0)
+        if delta == 0:
+            return
+
+        self._scroll_canvas.yview_scroll(int(-delta / 120), "units")
 
     def _build_text_panel(self, parent: tk.PanedWindow, title: str) -> tk.Text:
         frame = tk.Frame(parent, bg="white", bd=1, relief="solid")

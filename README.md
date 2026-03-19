@@ -207,6 +207,24 @@ powershell -ExecutionPolicy Bypass -File scripts/check-mobile-codex-runtime.ps1
 
 ## 常用命令
 
+### 本机一键启动（不依赖 PowerShell）
+
+```text
+scripts\start-mobile-codex-local.cmd
+```
+
+### 本机一键停止（不依赖 PowerShell）
+
+```text
+scripts\stop-mobile-codex-local.cmd
+```
+
+### 本机状态检查（不依赖 PowerShell）
+
+```text
+scripts\status-mobile-codex-local.cmd
+```
+
 ### 启动整套服务
 
 ```powershell
@@ -231,16 +249,12 @@ powershell -ExecutionPolicy Bypass -File scripts/check-tailscale-status.ps1
 scripts\package-mobile-codex-control.cmd
 ```
 
-### 维护者：生成便携发布目录
-
-```powershell
-scripts\package-mobile-codex-helper.cmd
-```
-
 说明：
 
 - 当前推荐发布形态就是“带内置运行环境的便携目录 + `MobileCodexControl.exe`”
-- 不再要求额外制作安装包
+- 仓库当前提供的是桌面工具打包脚本，不提供单独的 `package-mobile-codex-helper.cmd`
+- 便携目录的完整部署步骤请直接看 [`docs/DEPLOYMENT.zh-CN.md`](docs/DEPLOYMENT.zh-CN.md)
+- 如果你在当前环境里不想使用 PowerShell，优先使用上面的本机 `.cmd` 脚本
 
 ### 维护者：源码覆盖自测
 

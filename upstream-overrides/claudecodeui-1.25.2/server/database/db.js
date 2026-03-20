@@ -22,6 +22,15 @@ const c = {
     dim: (text) => `${colors.dim}${text}${colors.reset}`,
 };
 
+const DEFAULT_PREFERRED_LANGUAGE = 'zh-CN';
+const SUPPORTED_PREFERRED_LANGUAGES = new Set(['en', 'ko', 'zh-CN', 'ja', 'ru']);
+
+const normalizePreferredLanguage = (language) => (
+  typeof language === 'string' && SUPPORTED_PREFERRED_LANGUAGES.has(language)
+    ? language
+    : DEFAULT_PREFERRED_LANGUAGE
+);
+
 // Use DATABASE_PATH environment variable if set, otherwise use default location
 const DB_PATH = process.env.DATABASE_PATH || path.join(__dirname, 'auth.db');
 const INIT_SQL_PATH = path.join(__dirname, 'init.sql');
@@ -100,6 +109,11 @@ const runMigrations = () => {
       db.exec('ALTER TABLE users ADD COLUMN has_completed_onboarding BOOLEAN DEFAULT 0');
     }
 
+    if (!columnNames.includes('preferred_language')) {
+      console.log('Running migration: Adding preferred_language column');
+      db.exec('ALTER TABLE users ADD COLUMN preferred_language TEXT');
+    }
+
     // Create app_config table if it doesn't exist (for existing installations)
     db.exec(`CREATE TABLE IF NOT EXISTS app_config (
       key TEXT PRIMARY KEY,
@@ -118,6 +132,17 @@ const runMigrations = () => {
       UNIQUE(session_id, provider)
     )`);
     db.exec('CREATE INDEX IF NOT EXISTS idx_session_names_lookup ON session_names(session_id, provider)');
+
+    db.exec(`CREATE TABLE IF NOT EXISTS session_auto_titles (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      session_id TEXT NOT NULL,
+      provider TEXT NOT NULL DEFAULT 'claude',
+      auto_title TEXT NOT NULL,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE(session_id, provider)
+    )`);
+    db.exec('CREATE INDEX IF NOT EXISTS idx_session_auto_titles_lookup ON session_auto_titles(session_id, provider)');
 
     db.exec(`CREATE TABLE IF NOT EXISTS trusted_devices (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -253,6 +278,39 @@ const userDb = {
     try {
       const row = db.prepare('SELECT git_name, git_email FROM users WHERE id = ?').get(userId);
       return row;
+    } catch (err) {
+      throw err;
+    }
+  },
+
+  getPreferredLanguageRecord: (userId) => {
+    try {
+      const row = db.prepare('SELECT preferred_language FROM users WHERE id = ?').get(userId);
+      const rawLanguage = row?.preferred_language ?? null;
+
+      return {
+        language: normalizePreferredLanguage(rawLanguage),
+        isExplicitlySet: typeof rawLanguage === 'string' && SUPPORTED_PREFERRED_LANGUAGES.has(rawLanguage),
+      };
+    } catch (err) {
+      throw err;
+    }
+  },
+
+  getPreferredLanguage: (userId) => {
+    try {
+      return userDb.getPreferredLanguageRecord(userId).language;
+    } catch (err) {
+      throw err;
+    }
+  },
+
+  updatePreferredLanguage: (userId, preferredLanguage) => {
+    try {
+      const normalizedLanguage = normalizePreferredLanguage(preferredLanguage);
+      const stmt = db.prepare('UPDATE users SET preferred_language = ? WHERE id = ?');
+      stmt.run(normalizedLanguage, userId);
+      return normalizedLanguage;
     } catch (err) {
       throw err;
     }
@@ -658,6 +716,64 @@ const sessionNamesDb = {
   },
 };
 
+const sessionAutoTitlesDb = {
+  setTitle: (sessionId, provider, autoTitle) => {
+    db.prepare(`
+      INSERT INTO session_auto_titles (session_id, provider, auto_title)
+      VALUES (?, ?, ?)
+      ON CONFLICT(session_id, provider)
+      DO UPDATE SET auto_title = excluded.auto_title, updated_at = CURRENT_TIMESTAMP
+    `).run(sessionId, provider, autoTitle);
+  },
+
+  setTitles: (titles, provider) => {
+    if (!Array.isArray(titles) || titles.length === 0) {
+      return;
+    }
+
+    const upsertTitle = db.prepare(`
+      INSERT INTO session_auto_titles (session_id, provider, auto_title)
+      VALUES (?, ?, ?)
+      ON CONFLICT(session_id, provider)
+      DO UPDATE SET auto_title = excluded.auto_title, updated_at = CURRENT_TIMESTAMP
+    `);
+
+    const persistTitles = db.transaction((items) => {
+      for (const item of items) {
+        if (!item?.sessionId || !item?.autoTitle) {
+          continue;
+        }
+        upsertTitle.run(item.sessionId, provider, item.autoTitle);
+      }
+    });
+
+    persistTitles(titles);
+  },
+
+  getTitle: (sessionId, provider) => {
+    const row = db.prepare(
+      'SELECT auto_title FROM session_auto_titles WHERE session_id = ? AND provider = ?'
+    ).get(sessionId, provider);
+    return row?.auto_title || null;
+  },
+
+  getTitles: (sessionIds, provider) => {
+    if (!sessionIds.length) return new Map();
+    const placeholders = sessionIds.map(() => '?').join(',');
+    const rows = db.prepare(
+      `SELECT session_id, auto_title FROM session_auto_titles
+       WHERE session_id IN (${placeholders}) AND provider = ?`
+    ).all(...sessionIds, provider);
+    return new Map(rows.map(r => [r.session_id, r.auto_title]));
+  },
+
+  deleteTitle: (sessionId, provider) => {
+    return db.prepare(
+      'DELETE FROM session_auto_titles WHERE session_id = ? AND provider = ?'
+    ).run(sessionId, provider).changes > 0;
+  },
+};
+
 // Apply custom session names from the database (overrides CLI-generated summaries)
 function applyCustomSessionNames(sessions, provider) {
   if (!sessions?.length) return;
@@ -670,6 +786,57 @@ function applyCustomSessionNames(sessions, provider) {
     }
   } catch (error) {
     console.warn(`[DB] Failed to apply custom session names for ${provider}:`, error.message);
+  }
+}
+
+/**
+ * Apply persisted automatic titles and backfill any missing titles from the current session summary.
+ * @param {Array<{id?: string, summary?: string}>} sessions 会话列表；每项必须尽量提供 `id`，`summary` 作为待持久化的自动标题来源。
+ * @param {string} provider 提供方标识，必须与数据库中的 provider 列保持一致。
+ * @returns {void} 直接原地更新 sessions 中的 `summary` 字段，失败时仅记录警告日志。
+ */
+function applyPersistedSessionTitles(sessions, provider) {
+  if (!sessions?.length) return;
+
+  try {
+    const validSessions = sessions.filter((session) => typeof session?.id === 'string' && session.id.trim().length > 0);
+    if (validSessions.length === 0) {
+      return;
+    }
+
+    const ids = validSessions.map((session) => session.id);
+    const persistedTitles = sessionAutoTitlesDb.getTitles(ids, provider);
+    const titlesToPersist = [];
+
+    for (const session of validSessions) {
+      const persistedTitle = persistedTitles.get(session.id);
+      const derivedTitle = typeof session.summary === 'string' ? session.summary.trim() : '';
+      const shouldRefreshPersistedTitle = typeof persistedTitle === 'string' && persistedTitle.includes('Context from my IDE setup');
+
+      if (persistedTitle && !shouldRefreshPersistedTitle) {
+        session.summary = persistedTitle;
+        continue;
+      }
+
+      if (!derivedTitle) {
+        if (persistedTitle) {
+          session.summary = persistedTitle;
+        }
+        continue;
+      }
+
+      session.summary = derivedTitle;
+      titlesToPersist.push({
+        sessionId: session.id,
+        autoTitle: derivedTitle,
+      });
+    }
+
+    if (titlesToPersist.length > 0) {
+      sessionAutoTitlesDb.setTitles(titlesToPersist, provider);
+    }
+  } catch (error) {
+    console.warn(`[DB] Failed to apply automatic session titles for ${provider}:`, error.message);
   }
 }
 
@@ -727,6 +894,8 @@ export {
   credentialsDb,
   trustedDevicesDb,
   sessionNamesDb,
+  sessionAutoTitlesDb,
+  applyPersistedSessionTitles,
   applyCustomSessionNames,
   appConfigDb,
   githubTokensDb // Backward compatibility

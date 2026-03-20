@@ -92,6 +92,12 @@ ASCII_ALIAS_PATH = resolve_ascii_alias_path()
 TAILSCALE = resolve_tailscale_path()
 NGINX_ACCESS_LOG = ASCII_ALIAS_PATH / ".runtime" / "nginx" / "logs" / "mobile-codex.access.log"
 NGINX_ERROR_LOG = ASCII_ALIAS_PATH / ".runtime" / "nginx" / "logs" / "mobile-codex.error.log"
+CONTROL_STATE_PATH = ASCII_ALIAS_PATH / ".runtime" / "mobile-codex-control-state.json"
+DEFAULT_CONTROL_STATE = {
+    "remote_last_enabled_at": None,
+    "remote_last_error": None,
+    "remote_last_error_at": None,
+}
 
 
 def inspect_auth_db(path: Path) -> tuple[int, set[str]]:
@@ -222,6 +228,112 @@ def format_datetime(value: str | None) -> str:
     if not dt:
         return "暂无"
     return dt.astimezone().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def load_control_state() -> dict[str, Any]:
+    """Load the desktop control runtime state from disk.
+
+    Returns:
+        dict[str, Any]: Runtime state with default keys. If the file cannot be
+        read or parsed, `_error` contains the original failure text.
+    """
+    if not CONTROL_STATE_PATH.exists():
+        return dict(DEFAULT_CONTROL_STATE)
+
+    try:
+        payload = json.loads(CONTROL_STATE_PATH.read_text(encoding="utf-8"))
+    except Exception as exc:  # noqa: BLE001
+        state = dict(DEFAULT_CONTROL_STATE)
+        state["_error"] = f"控制台运行态读取失败：{exc}"
+        return state
+
+    state = dict(DEFAULT_CONTROL_STATE)
+    if isinstance(payload, dict):
+        state.update(
+            {
+                "remote_last_enabled_at": payload.get("remote_last_enabled_at"),
+                "remote_last_error": payload.get("remote_last_error"),
+                "remote_last_error_at": payload.get("remote_last_error_at"),
+            }
+        )
+    return state
+
+
+def persist_control_state(updates: dict[str, Any]) -> str | None:
+    """Persist runtime state updates for the desktop control panel.
+
+    Args:
+        updates: Partial state payload. Keys outside the supported runtime
+            fields are ignored.
+
+    Returns:
+        str | None: `None` on success. On failure returns the original error
+        text so the caller can expose it directly.
+    """
+    state = load_control_state()
+    state.update(updates)
+    state.pop("_error", None)
+
+    try:
+        CONTROL_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        serialized = json.dumps(state, ensure_ascii=False, indent=2)
+        temp_path = CONTROL_STATE_PATH.with_suffix(".tmp")
+        temp_path.write_text(serialized, encoding="utf-8")
+        temp_path.replace(CONTROL_STATE_PATH)
+        return None
+    except Exception as exc:  # noqa: BLE001
+        return f"控制台运行态写入失败：{exc}"
+
+
+def remember_remote_enabled() -> str | None:
+    """Record a successful remote publish activation."""
+    return persist_control_state(
+        {
+            "remote_last_enabled_at": now_local().isoformat(),
+            "remote_last_error": None,
+            "remote_last_error_at": None,
+        }
+    )
+
+
+def remember_remote_error(error_message: str) -> str | None:
+    """Record the last remote publish failure message."""
+    return persist_control_state(
+        {
+            "remote_last_error": error_message,
+            "remote_last_error_at": now_local().isoformat(),
+        }
+    )
+
+
+def build_remote_meta_text(summary: dict[str, Any]) -> str:
+    """Build the compact remote publish metadata line for the UI."""
+    enabled_at = summary.get("remote_last_enabled_at")
+    if enabled_at:
+        return f"最近开启：{format_datetime(enabled_at)}"
+    if summary.get("remote_enabled"):
+        return "最近开启：未记录（可能由外部命令开启）"
+    return "最近开启：暂无"
+
+
+def build_remote_error_text(summary: dict[str, Any]) -> str:
+    """Build the remote failure detail line for the UI."""
+    error_message = summary.get("remote_last_error")
+    if not error_message:
+        return "最近失败：无"
+
+    error_at = summary.get("remote_last_error_at")
+    if error_at:
+        return f"最近失败：{format_datetime(error_at)} | {error_message}"
+    return f"最近失败：{error_message}"
+
+
+def build_remote_metric_detail(summary: dict[str, Any]) -> str:
+    """Build the summary card detail for remote publish."""
+    parts = [summary["remote_detail"], build_remote_meta_text(summary)]
+    if summary.get("remote_level") != "success" and summary.get("remote_last_error"):
+        parts.append(build_remote_error_text(summary))
+    return " | ".join(part for part in parts if part)
 
 
 def minutes_since(value: str | None) -> float | None:
@@ -769,6 +881,7 @@ def collect_status() -> dict[str, Any]:
     listener_map = get_listener_map()
     app_listener = listener_map.get(APP_PORT)
     proxy_listener = listener_map.get(PROXY_PORT)
+    control_state = load_control_state()
 
     app_ok, app_health_detail = http_health(APP_HEALTH_URL)
     proxy_ok, proxy_health_detail = http_health(PROXY_HEALTH_URL)
@@ -836,7 +949,11 @@ def collect_status() -> dict[str, Any]:
         "approved_devices": approved_devices,
         "pending_device_approvals": pending_approvals,
         "recent_mobile_requests": recent_requests,
-        "diagnostics": [f"[本地] 认证数据库：{AUTH_DB_PATH}"] + tail_error_lines(),
+        "diagnostics": (
+            [f"[本地] 认证数据库：{AUTH_DB_PATH}"]
+            + ([control_state["_error"]] if control_state.get("_error") else [])
+            + tail_error_lines()
+        ),
         "summary": {
             "app_running": app_ok,
             "nginx_running": proxy_ok,
@@ -847,6 +964,9 @@ def collect_status() -> dict[str, Any]:
             "remote_level": remote_summary["level"],
             "remote_value": remote_summary["value"],
             "remote_detail": remote_summary["detail"],
+            "remote_last_enabled_at": control_state.get("remote_last_enabled_at"),
+            "remote_last_error": control_state.get("remote_last_error"),
+            "remote_last_error_at": control_state.get("remote_last_error_at"),
             "approved_devices": len(approved_devices),
             "pending_approvals": len(pending_approvals),
             "mobile_online": mobile_online,
@@ -892,6 +1012,41 @@ def wait_for_remote_reachable(timeout: float = 8.0) -> bool:
     return wait_for(_remote_ok, timeout=timeout, interval=1.0)
 
 
+def enable_remote_publish() -> str:
+    """Enable Tailscale Serve for the mobile control panel."""
+    result = run_command([str(TAILSCALE), "serve", "--bg", REMOTE_TARGET], timeout=20)
+    if result.returncode != 0:
+        error_message = result.stderr.strip() or result.stdout.strip() or "开启远程发布失败"
+        state_warning = remember_remote_error(error_message)
+        raise RuntimeError(f"{error_message}；{state_warning}" if state_warning else error_message)
+
+    if not wait_for(remote_publish_is_enabled, timeout=12, interval=1.0):
+        error_message = "远程发布命令已执行，但 Tailscale Serve 状态仍未生效"
+        state_warning = remember_remote_error(error_message)
+        raise RuntimeError(f"{error_message}；{state_warning}" if state_warning else error_message)
+
+    state_warning = remember_remote_enabled()
+    if wait_for_remote_reachable(timeout=8):
+        return "远程发布已开启，远程地址可访问" + (f"；{state_warning}" if state_warning else "")
+    return "远程发布已开启，若手机端暂时打不开请等待几秒后刷新" + (f"；{state_warning}" if state_warning else "")
+
+
+def disable_remote_publish() -> str:
+    """Disable Tailscale Serve for the mobile control panel."""
+    result = run_command([str(TAILSCALE), "serve", "reset"], timeout=10)
+    if result.returncode != 0:
+        error_message = result.stderr.strip() or result.stdout.strip() or "关闭远程发布失败"
+        state_warning = remember_remote_error(error_message)
+        raise RuntimeError(f"{error_message}；{state_warning}" if state_warning else error_message)
+
+    if not wait_for(lambda: not remote_publish_is_enabled(), timeout=8, interval=0.8):
+        error_message = "远程发布关闭命令已执行，但 Serve 状态仍存在"
+        state_warning = remember_remote_error(error_message)
+        raise RuntimeError(f"{error_message}；{state_warning}" if state_warning else error_message)
+
+    return "远程发布已关闭"
+
+
 def perform_action(action: str) -> str:
     if action == "start":
         result = powershell_file("start-mobile-codex-stack.ps1", timeout=30)
@@ -919,22 +1074,10 @@ def perform_action(action: str) -> str:
         return "整套服务已停止"
 
     if action == "enable_remote":
-        result = run_command([str(TAILSCALE), "serve", "--bg", REMOTE_TARGET], timeout=20)
-        if result.returncode != 0:
-            raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "开启远程发布失败")
-        if not wait_for(remote_publish_is_enabled, timeout=12, interval=1.0):
-            raise RuntimeError("远程发布命令已执行，但 Tailscale Serve 状态仍未生效")
-        if wait_for_remote_reachable(timeout=8):
-            return "远程发布已开启，远程地址可访问"
-        return "远程发布已开启，若手机端暂时打不开请等待几秒后刷新"
+        return enable_remote_publish()
 
     if action == "disable_remote":
-        result = run_command([str(TAILSCALE), "serve", "reset"], timeout=10)
-        if result.returncode != 0:
-            raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "关闭远程发布失败")
-        if not wait_for(lambda: not remote_publish_is_enabled(), timeout=8, interval=0.8):
-            raise RuntimeError("远程发布关闭命令已执行，但 Serve 状态仍存在")
-        return "远程发布已关闭"
+        return disable_remote_publish()
 
     if action == "open_local":
         webbrowser.open(LOCAL_PANEL_URL)
@@ -964,6 +1107,10 @@ class ControlApp:
         self.last_refresh_text = tk.StringVar(value="尚未刷新")
         self.local_url_text = tk.StringVar(value=f"本地面板：{LOCAL_PANEL_URL}")
         self.remote_url_text = tk.StringVar(value="远程地址：未开启")
+        self.remote_meta_text = tk.StringVar(value="最近开启：暂无")
+        self.remote_error_text = tk.StringVar(value="最近失败：无")
+        self.local_url_value = LOCAL_PANEL_URL
+        self.remote_url_value: str | None = None
         self.block_labels: list[dict[str, tk.Label]] = []
         self.metric_widgets: dict[str, dict[str, Any]] = {}
         self.pending_approval_items: list[dict[str, Any]] = []
@@ -971,6 +1118,9 @@ class ControlApp:
         self._busy = False
         self._scroll_canvas: tk.Canvas | None = None
         self._scroll_window: int | None = None
+        self.local_copy_button: tk.Button | None = None
+        self.remote_copy_button: tk.Button | None = None
+        self.remote_url_label: tk.Label | None = None
 
         self._build_ui()
         self.refresh_status()
@@ -1001,20 +1151,78 @@ class ControlApp:
 
         endpoint_bar = tk.Frame(container, bg="#dbe8f6", bd=1, relief="solid")
         endpoint_bar.pack(fill="x", pady=(0, 12))
+        local_row = tk.Frame(endpoint_bar, bg="#dbe8f6")
+        local_row.pack(fill="x", padx=12, pady=(10, 2))
         tk.Label(
-            endpoint_bar,
+            local_row,
             textvariable=self.local_url_text,
             font=("Microsoft YaHei UI", 10, "bold"),
             bg="#dbe8f6",
             fg="#17324d",
-        ).pack(anchor="w", padx=12, pady=(10, 2))
-        tk.Label(
-            endpoint_bar,
+        ).pack(side="left", fill="x", expand=True)
+        self.local_copy_button = tk.Button(
+            local_row,
+            text="复制本地地址",
+            command=lambda: self._copy_url(self.local_url_value, "本地地址"),
+            font=("Microsoft YaHei UI", 9, "bold"),
+            bg="#1f6feb",
+            fg="white",
+            activebackground="#1f6feb",
+            activeforeground="white",
+            relief="flat",
+            padx=10,
+            pady=4,
+            cursor="hand2",
+        )
+        self.local_copy_button.pack(side="right", padx=(12, 0))
+
+        remote_row = tk.Frame(endpoint_bar, bg="#dbe8f6")
+        remote_row.pack(fill="x", padx=12, pady=(0, 10))
+        self.remote_url_label = tk.Label(
+            remote_row,
             textvariable=self.remote_url_text,
             font=("Microsoft YaHei UI", 10),
             bg="#dbe8f6",
-            fg="#17324d",
-        ).pack(anchor="w", padx=12, pady=(0, 10))
+            fg="#6b7280",
+            cursor="arrow",
+        )
+        self.remote_url_label.bind("<Button-1>", lambda _event: self._open_url(self.remote_url_value, "远程地址"))
+        self.remote_url_label.pack(side="left", fill="x", expand=True)
+        self.remote_copy_button = tk.Button(
+            remote_row,
+            text="复制远程地址",
+            command=lambda: self._copy_url(self.remote_url_value, "远程地址"),
+            font=("Microsoft YaHei UI", 9, "bold"),
+            bg="#0b7285",
+            fg="white",
+            activebackground="#0b7285",
+            activeforeground="white",
+            relief="flat",
+            padx=10,
+            pady=4,
+            cursor="hand2",
+            state="disabled",
+        )
+        self.remote_copy_button.pack(side="right", padx=(12, 0))
+        tk.Label(
+            endpoint_bar,
+            textvariable=self.remote_meta_text,
+            font=("Microsoft YaHei UI", 9),
+            bg="#dbe8f6",
+            fg="#35506d",
+            anchor="w",
+            justify="left",
+        ).pack(fill="x", padx=12, pady=(0, 4))
+        tk.Label(
+            endpoint_bar,
+            textvariable=self.remote_error_text,
+            font=("Microsoft YaHei UI", 9),
+            bg="#dbe8f6",
+            fg="#8f1d1d",
+            anchor="w",
+            justify="left",
+            wraplength=1100,
+        ).pack(fill="x", padx=12, pady=(0, 10))
 
         summary_strip = tk.Frame(container, bg="#eef3f8")
         summary_strip.pack(fill="x", pady=(0, 12))
@@ -1254,6 +1462,24 @@ class ControlApp:
 
         self._scroll_canvas.yview_scroll(int(-delta / 120), "units")
 
+    def _copy_url(self, url: str | None, label: str) -> None:
+        if not url:
+            self.status_text.set(f"{label}尚未生成，暂时无法复制。")
+            return
+
+        self.root.clipboard_clear()
+        self.root.clipboard_append(url)
+        self.root.update()
+        self.status_text.set(f"已复制{label}：{url}")
+
+    def _open_url(self, url: str | None, label: str) -> None:
+        if not url:
+            self.status_text.set(f"{label}尚未生成，暂时无法打开。")
+            return
+
+        webbrowser.open(url)
+        self.status_text.set(f"已打开{label}：{url}")
+
     def _build_text_panel(self, parent: tk.PanedWindow, title: str) -> tk.Text:
         frame = tk.Frame(parent, bg="white", bd=1, relief="solid")
         parent.add(frame, stretch="always")
@@ -1427,7 +1653,8 @@ class ControlApp:
                 message = task()
                 self.root.after(0, lambda: self.status_text.set(message))
             except Exception as exc:  # noqa: BLE001
-                self.root.after(0, lambda: self.status_text.set(f"操作失败：{exc}"))
+                error_message = f"操作失败：{exc}"
+                self.root.after(0, lambda msg=error_message: self.status_text.set(msg))
             finally:
                 self.root.after(0, self._mark_idle)
 
@@ -1443,8 +1670,21 @@ class ControlApp:
     def apply_status(self, status: dict[str, Any]) -> None:
         summary = status["summary"]
         self.last_refresh_text.set(f"最近刷新：{status['checked_at']}")
-        self.local_url_text.set(f"本地面板：{status['local_url']}")
-        self.remote_url_text.set(f"远程地址：{status['remote_url'] or '未开启'}")
+        self.local_url_value = status["local_url"]
+        self.remote_url_value = status["remote_url"] or None
+        self.local_url_text.set(f"本地面板：{self.local_url_value}")
+        self.remote_url_text.set(f"远程地址：{self.remote_url_value or '未开启'}")
+        self.remote_meta_text.set(build_remote_meta_text(summary))
+        self.remote_error_text.set(build_remote_error_text(summary))
+        if self.local_copy_button is not None:
+            self.local_copy_button.configure(state="normal")
+        if self.remote_copy_button is not None:
+            self.remote_copy_button.configure(state="normal" if self.remote_url_value else "disabled")
+        if self.remote_url_label is not None:
+            self.remote_url_label.configure(
+                fg="#0b7285" if self.remote_url_value else "#6b7280",
+                cursor="hand2" if self.remote_url_value else "arrow",
+            )
 
         metric_values = {
             "services": (
@@ -1454,7 +1694,7 @@ class ControlApp:
             ),
             "remote": (
                 summary["remote_value"],
-                summary["remote_detail"],
+                build_remote_metric_detail(summary),
                 summary["remote_level"],
             ),
             "mobile": (

@@ -251,6 +251,33 @@ powershell -ExecutionPolicy Bypass -File scripts/start-mobile-codex-stack.ps1
 - 启动应用服务到 `127.0.0.1:3001`
 - 启动 nginx 到 `127.0.0.1:8080`
 
+如果你希望手机端只管理固定几个项目，启动脚本还会自动读取：
+
+```text
+config/mobile-projects.json
+```
+
+格式示例：
+
+```json
+{
+  "allowedProjects": [
+    {
+      "path": "H:\\GitHub\\mobileCodexHelper",
+      "displayName": "mobileCodexHelper"
+    }
+  ]
+}
+```
+
+启用后：
+
+- 左侧只显示白名单里的项目
+- “打开文件夹”模式只返回这些允许项目
+- 不在白名单里的工作区不能从面板加入
+
+建议把你常用的几个项目都写进这个文件后再启动服务。
+
 如果你当前环境不方便使用 PowerShell，也可以直接执行：
 
 ```text

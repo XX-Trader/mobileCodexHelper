@@ -134,6 +134,58 @@ The important point is:
 - those fallbacks exist for compatibility, not to weaken the trust model
 - new devices still require approval before they become trusted
 
+## Why unread red badges moved to the server
+
+The green and red sidebar indicators look related, but they represent different kinds of state:
+
+- green means a session is still processing, so it remains a realtime backend-driven status
+- red means a session finished and has not been viewed yet, so it is a durable result state that should sync across devices
+
+To make "phone and desktop stay in sync when either side opens the finished session" work reliably, unread red badges now live on the server:
+
+- the unread-completed state is stored in `session_notifications`
+- the backend writes unread state when a session finishes
+- any device can clear it through `/api/session-notifications/read`
+- the server then broadcasts `session-notifications-state` over WebSocket so every connected client updates together
+
+This keeps the split intentional:
+
+- red unread state is cross-device and durable
+- green processing state stays lightweight and realtime
+- no extra device heartbeat system is required just to keep unread badges consistent
+
+## Why project hiding lives in server-side config
+
+On mobile, too many projects create noise. The real requirement is usually "hide it for now without deleting anything".
+
+That is why project visibility is not stored as a frontend-only preference. It is written back to `~/.claude/project-config.json` instead:
+
+- hidden projects are marked with `hidden: true`
+- the main project list filters them out
+- the "hidden projects" dialog reads and restores them through backend APIs
+- in fixed allowlist mode, hidden projects also disappear from the folder-picker suggestions
+
+Benefits:
+
+- hidden state survives page refreshes
+- phone and desktop stay aligned on the same project visibility
+- no project files or conversation history are deleted by accident
+
+## Why language preference also moved server-side
+
+If language only lives in browser `localStorage`, then:
+
+- `127.0.0.1` and the Tailscale hostname each keep a separate value
+- desktop and mobile browsers can show different languages for the same account
+- every new device has to be switched manually again
+
+Language preference is now stored at the user level:
+
+- the default language is Simplified Chinese
+- after login, the frontend syncs from the server-side preference
+- older devices that only had a local language saved can migrate it once when the server has not been explicitly set yet
+- the same account now sees one consistent language across desktop and mobile
+
 ## Why hardened mode stays enabled by default
 
 Because the goal is remote phone control, not full remote exposure of every capability.

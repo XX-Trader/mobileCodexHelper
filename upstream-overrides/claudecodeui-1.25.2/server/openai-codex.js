@@ -205,6 +205,11 @@ function transformCodexEvent(event) {
  */
 function mapPermissionModeToCodexOptions(permissionMode) {
   switch (permissionMode) {
+    case 'plan':
+      return {
+        sandboxMode: 'read-only',
+        approvalPolicy: 'never'
+      };
     case 'acceptEdits':
       return {
         sandboxMode: 'workspace-write',
@@ -224,10 +229,22 @@ function mapPermissionModeToCodexOptions(permissionMode) {
   }
 }
 
+function buildPlanModePrompt(command) {
+  return [
+    'Plan mode is enabled.',
+    'Do not execute commands, modify files, or use tools.',
+    'Respond with analysis and an implementation plan only.',
+    'If inspection would normally require a command, describe what you would inspect instead of running it.',
+    '',
+    'User request:',
+    command
+  ].join('\n');
+}
+
 /**
  * Execute a Codex query with streaming
  * @param {string} command - The prompt to send
- * @param {object} options - Options including cwd, sessionId, model, permissionMode
+ * @param {object} options - Options including cwd, sessionId, model, permissionMode, modelReasoningEffort
  * @param {WebSocket|object} ws - WebSocket connection or response writer
  */
 export async function queryCodex(command, options = {}, ws) {
@@ -236,6 +253,7 @@ export async function queryCodex(command, options = {}, ws) {
     cwd,
     projectPath,
     model,
+    modelReasoningEffort,
     permissionMode = 'default'
   } = options;
 
@@ -245,6 +263,7 @@ export async function queryCodex(command, options = {}, ws) {
     console.log('[Codex] Using ASCII working directory alias:', workingDirectory, 'for', requestedWorkingDirectory);
   }
   const { sandboxMode, approvalPolicy } = mapPermissionModeToCodexOptions(permissionMode);
+  const effectiveCommand = permissionMode === 'plan' ? buildPlanModePrompt(command) : command;
 
   let codex;
   let thread;
@@ -261,7 +280,8 @@ export async function queryCodex(command, options = {}, ws) {
       skipGitRepoCheck: true,
       sandboxMode,
       approvalPolicy,
-      model
+      model,
+      modelReasoningEffort
     };
 
     // Start or resume thread
@@ -291,7 +311,7 @@ export async function queryCodex(command, options = {}, ws) {
     });
 
     // Execute with streaming
-    const streamedTurn = await thread.runStreamed(command, {
+    const streamedTurn = await thread.runStreamed(effectiveCommand, {
       signal: abortController.signal
     });
 

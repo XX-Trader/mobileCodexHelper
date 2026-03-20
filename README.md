@@ -34,6 +34,7 @@
 - 在手机浏览器中查看 Codex 项目和会话
 - 在手机上发送消息，继续控制电脑上的 Codex
 - 首次登录新设备时，必须由电脑端批准
+- 电脑端和手机端共享同一套界面语言偏好，默认简体中文
 - 在 Windows 桌面工具中查看：
   - 本地服务状态
   - 手机访问开关状态
@@ -225,6 +226,24 @@ scripts\stop-mobile-codex-local.cmd
 scripts\status-mobile-codex-local.cmd
 ```
 
+### 启用 Tailscale 远程访问（不依赖 PowerShell）
+
+```text
+scripts\enable-mobile-codex-remote.cmd
+```
+
+### 安装 Windows 登录自启（不依赖 PowerShell）
+
+```text
+scripts\install-mobile-codex-autostart.cmd
+```
+
+### 卸载 Windows 登录自启（不依赖 PowerShell）
+
+```text
+scripts\remove-mobile-codex-autostart.cmd
+```
+
 ### 启动整套服务
 
 ```powershell
@@ -255,6 +274,7 @@ scripts\package-mobile-codex-control.cmd
 - 仓库当前提供的是桌面工具打包脚本，不提供单独的 `package-mobile-codex-helper.cmd`
 - 便携目录的完整部署步骤请直接看 [`docs/DEPLOYMENT.zh-CN.md`](docs/DEPLOYMENT.zh-CN.md)
 - 如果你在当前环境里不想使用 PowerShell，优先使用上面的本机 `.cmd` 脚本
+- 如果你希望电脑登录后自动恢复本地服务和手机访问，直接看 [`docs/AUTOSTART.zh-CN.md`](docs/AUTOSTART.zh-CN.md)
 
 ### 维护者：源码覆盖自测
 
@@ -301,6 +321,7 @@ powershell -ExecutionPolicy Bypass -File scripts/smoke-test-override-flow.ps1 -U
 ## 推荐阅读
 
 - 部署说明：[`docs/DEPLOYMENT.zh-CN.md`](docs/DEPLOYMENT.zh-CN.md)
+- 登录自启：[`docs/AUTOSTART.zh-CN.md`](docs/AUTOSTART.zh-CN.md)
 - 架构说明：[`docs/ARCHITECTURE.zh-CN.md`](docs/ARCHITECTURE.zh-CN.md)
 - 安全策略：[`SECURITY.zh-CN.md`](SECURITY.zh-CN.md)
 - 开源发布检查清单：[`docs/OPEN_SOURCE_RELEASE_CHECKLIST.zh-CN.md`](docs/OPEN_SOURCE_RELEASE_CHECKLIST.zh-CN.md)

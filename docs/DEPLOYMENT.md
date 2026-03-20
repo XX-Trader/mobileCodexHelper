@@ -140,6 +140,33 @@ By default this starts:
 - app service on `127.0.0.1:3001`
 - nginx proxy on `127.0.0.1:8080`
 
+If you want the phone panel to manage only a fixed set of projects, the startup script also reads:
+
+```text
+config/mobile-projects.json
+```
+
+Example:
+
+```json
+{
+  "allowedProjects": [
+    {
+      "path": "H:\\GitHub\\mobileCodexHelper",
+      "displayName": "mobileCodexHelper"
+    }
+  ]
+}
+```
+
+When enabled:
+
+- the sidebar only shows allowlisted projects
+- the “open folder” flow only returns those allowed projects
+- workspaces outside the allowlist cannot be added through the panel
+
+Populate this file with the projects you want to manage from your phone before starting the stack.
+
 ## Step 7: Launch the desktop control tool
 
 ```powershell

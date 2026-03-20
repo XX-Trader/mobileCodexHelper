@@ -32,6 +32,7 @@ $env:HOST = '127.0.0.1'
 $env:PORT = '3001'
 $env:CODEX_ONLY_HARDENED_MODE = 'true'
 $env:VITE_CODEX_ONLY_HARDENED_MODE = 'true'
+$env:MOBILE_CODEX_PROJECTS_CONFIG = Join-Path $workspace 'config\mobile-projects.json'
 
 Set-Location $repo
 & $node 'server/index.js' 1>> $stdoutLog 2>> $stderrLog

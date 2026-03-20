@@ -1,6 +1,6 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import { useAuth } from '../components/auth/context/AuthContext';
-import { getDeviceIdentity, getStoredDeviceSession } from '../components/auth/deviceTrust.js';
+import { getStoredDeviceSession } from '../components/auth/deviceTrust.js';
 import { IS_PLATFORM } from '../constants/config';
 
 type WebSocketContextType = {
@@ -24,15 +24,15 @@ const buildWebSocketUrl = () => {
   const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
   const url = new URL(`${protocol}//${window.location.host}/ws`);
   const deviceSession = getStoredDeviceSession();
-  const appType = getDeviceIdentity().appType;
 
-  // Keep token-in-query fallback limited to WebView-like shells that may not
-  // consistently send the auth cookie during the WebSocket handshake.
-  if (deviceSession?.token && (appType === 'webview' || appType === 'standalone')) {
+  // The app authenticates normal HTTP requests with the persisted device token.
+  // Mirror that behavior for WebSocket handshakes so browser mode does not
+  // silently fail when no auth cookie is present.
+  if (deviceSession?.token) {
     url.searchParams.set('token', deviceSession.token);
   }
   if (IS_PLATFORM) return url.toString(); // Platform mode: Use same domain as the page (goes through proxy)
-  return url.toString(); // OSS mode: cookie auth by default, query-token fallback only for WebViews
+  return url.toString(); // OSS mode: keep WebSocket auth aligned with authenticatedFetch
 };
 
 const useWebSocketProviderState = (): WebSocketContextType => {

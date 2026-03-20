@@ -5,7 +5,7 @@ import path from 'path';
 import os from 'os';
 import TOML from '@iarna/toml';
 import { getCodexSessions, getCodexSessionMessages, deleteCodexSession } from '../projects.js';
-import { applyCustomSessionNames, sessionNamesDb } from '../database/db.js';
+import { applyPersistedSessionTitles, applyCustomSessionNames, sessionAutoTitlesDb, sessionNamesDb } from '../database/db.js';
 
 const router = express.Router();
 const CODEX_ONLY_HARDENED_MODE = process.env.CODEX_ONLY_HARDENED_MODE !== 'false';
@@ -67,6 +67,7 @@ router.get('/sessions', async (req, res) => {
     }
 
     const sessions = await getCodexSessions(projectPath);
+    applyPersistedSessionTitles(sessions, 'codex');
     applyCustomSessionNames(sessions, 'codex');
     res.json({ success: true, sessions });
   } catch (error) {
@@ -102,6 +103,7 @@ router.delete('/sessions/:sessionId', async (req, res) => {
     const { sessionId } = req.params;
     await deleteCodexSession(sessionId);
     sessionNamesDb.deleteName(sessionId, 'codex');
+    sessionAutoTitlesDb.deleteTitle(sessionId, 'codex');
     res.json({ success: true });
   } catch (error) {
     console.error(`Error deleting Codex session ${req.params.sessionId}:`, error);

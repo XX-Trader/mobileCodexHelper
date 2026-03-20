@@ -66,7 +66,7 @@ import sqlite3 from 'sqlite3';
 import { open } from 'sqlite';
 import os from 'os';
 import sessionManager from './sessionManager.js';
-import { applyCustomSessionNames } from './database/db.js';
+import { applyCustomSessionNames, applyPersistedSessionTitles } from './database/db.js';
 
 const CODEX_ONLY_HARDENED_MODE = process.env.CODEX_ONLY_HARDENED_MODE !== 'false';
 
@@ -439,10 +439,24 @@ async function saveProjectConfig(config) {
   await fs.writeFile(configPath, JSON.stringify(config, null, 2), 'utf8');
 }
 
+function getLastPathSegment(projectPath) {
+  if (!projectPath || typeof projectPath !== 'string') {
+    return '';
+  }
+
+  const normalizedPath = path.normalize(projectPath.trim()).replace(/[\\/]+$/, '');
+  if (!normalizedPath) {
+    return '';
+  }
+
+  const lastSegment = path.basename(normalizedPath);
+  return lastSegment && lastSegment !== '.' ? lastSegment : normalizedPath;
+}
+
 // Generate better display name from path
 async function generateDisplayName(projectName, actualProjectDir = null) {
   // Use actual project directory if provided, otherwise decode from project name
-  let projectPath = actualProjectDir || projectName.replace(/-/g, '/');
+  const projectPath = actualProjectDir || projectName.replace(/-/g, '/');
 
   // Try to read package.json from the project path
   try {
@@ -458,14 +472,7 @@ async function generateDisplayName(projectName, actualProjectDir = null) {
     // Fall back to path-based naming if package.json doesn't exist or can't be read
   }
 
-  // If it starts with /, it's an absolute path
-  if (projectPath.startsWith('/')) {
-    const parts = projectPath.split('/').filter(Boolean);
-    // Return only the last folder name
-    return parts[parts.length - 1] || projectPath;
-  }
-
-  return projectPath;
+  return getLastPathSegment(projectPath) || projectPath;
 }
 
 // Extract the actual project directory from JSONL sessions (with caching)
@@ -670,6 +677,7 @@ async function getProjects(progressCallback = null) {
           total: 0
         };
       }
+      applyPersistedSessionTitles(project.sessions, 'claude');
       applyCustomSessionNames(project.sessions, 'claude');
 
       // Also fetch Cursor sessions for this project
@@ -679,6 +687,7 @@ async function getProjects(progressCallback = null) {
         console.warn(`Could not load Cursor sessions for project ${entry.name}:`, e.message);
         project.cursorSessions = [];
       }
+      applyPersistedSessionTitles(project.cursorSessions, 'cursor');
       applyCustomSessionNames(project.cursorSessions, 'cursor');
 
       // Also fetch Codex sessions for this project
@@ -690,6 +699,7 @@ async function getProjects(progressCallback = null) {
         console.warn(`Could not load Codex sessions for project ${entry.name}:`, e.message);
         project.codexSessions = [];
       }
+      applyPersistedSessionTitles(project.codexSessions, 'codex');
       applyCustomSessionNames(project.codexSessions, 'codex');
 
       // Also fetch Gemini sessions for this project (UI + CLI)
@@ -703,6 +713,7 @@ async function getProjects(progressCallback = null) {
         console.warn(`Could not load Gemini sessions for project ${entry.name}:`, e.message);
         project.geminiSessions = [];
       }
+      applyPersistedSessionTitles(project.geminiSessions, 'gemini');
       applyCustomSessionNames(project.geminiSessions, 'gemini');
 
       // Add TaskMaster detection
@@ -787,6 +798,7 @@ async function getProjects(progressCallback = null) {
       } catch (e) {
         console.warn(`Could not load Cursor sessions for manual project ${projectName}:`, e.message);
       }
+      applyPersistedSessionTitles(project.cursorSessions, 'cursor');
       applyCustomSessionNames(project.cursorSessions, 'cursor');
 
       // Try to fetch Codex sessions for manual projects too
@@ -797,6 +809,7 @@ async function getProjects(progressCallback = null) {
       } catch (e) {
         console.warn(`Could not load Codex sessions for manual project ${projectName}:`, e.message);
       }
+      applyPersistedSessionTitles(project.codexSessions, 'codex');
       applyCustomSessionNames(project.codexSessions, 'codex');
 
       // Try to fetch Gemini sessions for manual projects too (UI + CLI)
@@ -808,6 +821,7 @@ async function getProjects(progressCallback = null) {
       } catch (e) {
         console.warn(`Could not load Gemini sessions for manual project ${projectName}:`, e.message);
       }
+      applyPersistedSessionTitles(project.geminiSessions, 'gemini');
       applyCustomSessionNames(project.geminiSessions, 'gemini');
 
       // Add TaskMaster detection for manual projects
@@ -980,10 +994,30 @@ async function getSessions(projectName, limit = 5, offset = 0) {
   }
 }
 
+const SESSION_SUMMARY_MAX_LENGTH = 50;
+
+function summarizeSessionText(text, fallbackTitle = 'New Session') {
+  const normalizedFallback = typeof fallbackTitle === 'string' && fallbackTitle.trim()
+    ? fallbackTitle.replace(/\s+/g, ' ').trim()
+    : 'New Session';
+
+  if (typeof text !== 'string') {
+    return normalizedFallback;
+  }
+
+  const normalizedText = text.replace(/\s+/g, ' ').trim();
+  if (!normalizedText) {
+    return normalizedFallback;
+  }
+
+  return normalizedText.length > SESSION_SUMMARY_MAX_LENGTH
+    ? `${normalizedText.substring(0, SESSION_SUMMARY_MAX_LENGTH)}...`
+    : normalizedText;
+}
+
 async function parseJsonlSessions(filePath) {
   const sessions = new Map();
   const entries = [];
-  const pendingSummaries = new Map(); // leafUuid -> summary for entries without sessionId
 
   try {
     const fileStream = fsSync.createReadStream(filePath);
@@ -998,11 +1032,6 @@ async function parseJsonlSessions(filePath) {
           const entry = JSON.parse(line);
           entries.push(entry);
 
-          // Handle summary entries that don't have sessionId yet
-          if (entry.type === 'summary' && entry.summary && !entry.sessionId && entry.leafUuid) {
-            pendingSummaries.set(entry.leafUuid, entry.summary);
-          }
-
           if (entry.sessionId) {
             if (!sessions.has(entry.sessionId)) {
               sessions.set(entry.sessionId, {
@@ -1011,24 +1040,13 @@ async function parseJsonlSessions(filePath) {
                 messageCount: 0,
                 lastActivity: new Date(),
                 cwd: entry.cwd || '',
-                lastUserMessage: null,
-                lastAssistantMessage: null
+                firstUserMessage: null
               });
             }
 
             const session = sessions.get(entry.sessionId);
 
-            // Apply pending summary if this entry has a parentUuid that matches a pending summary
-            if (session.summary === 'New Session' && entry.parentUuid && pendingSummaries.has(entry.parentUuid)) {
-              session.summary = pendingSummaries.get(entry.parentUuid);
-            }
-
-            // Update summary from summary entries with sessionId
-            if (entry.type === 'summary' && entry.summary) {
-              session.summary = entry.summary;
-            }
-
-            // Track last user and assistant messages (skip system messages)
+            // Track the first visible user message so automatic titles stay stable.
             if (entry.message?.role === 'user' && entry.message?.content) {
               const content = entry.message.content;
 
@@ -1052,37 +1070,8 @@ async function parseJsonlSessions(filePath) {
                 textContent === 'Warmup' // Explicitly filter out "Warmup"
               );
 
-              if (typeof textContent === 'string' && textContent.length > 0 && !isSystemMessage) {
-                session.lastUserMessage = textContent;
-              }
-            } else if (entry.message?.role === 'assistant' && entry.message?.content) {
-              // Skip API error messages using the isApiErrorMessage flag
-              if (entry.isApiErrorMessage === true) {
-                // Skip this message entirely
-              } else {
-                // Track last assistant text message
-                let assistantText = null;
-
-                if (Array.isArray(entry.message.content)) {
-                  for (const part of entry.message.content) {
-                    if (part.type === 'text' && part.text) {
-                      assistantText = part.text;
-                    }
-                  }
-                } else if (typeof entry.message.content === 'string') {
-                  assistantText = entry.message.content;
-                }
-
-                // Additional filter for assistant messages with system content
-                const isSystemAssistantMessage = typeof assistantText === 'string' && (
-                  assistantText.startsWith('Invalid API key') ||
-                  assistantText.includes('{"subtasks":') ||
-                  assistantText.includes('CRITICAL: You MUST respond with ONLY a JSON')
-                );
-
-                if (assistantText && !isSystemAssistantMessage) {
-                  session.lastAssistantMessage = assistantText;
-                }
+              if (typeof textContent === 'string' && textContent.length > 0 && !isSystemMessage && !session.firstUserMessage) {
+                session.firstUserMessage = textContent;
               }
             }
 
@@ -1098,15 +1087,8 @@ async function parseJsonlSessions(filePath) {
       }
     }
 
-    // After processing all entries, set final summary based on last message if no summary exists
     for (const session of sessions.values()) {
-      if (session.summary === 'New Session') {
-        // Prefer last user message, fall back to last assistant message
-        const lastMessage = session.lastUserMessage || session.lastAssistantMessage;
-        if (lastMessage) {
-          session.summary = lastMessage.length > 50 ? lastMessage.substring(0, 50) + '...' : lastMessage;
-        }
-      }
+      session.summary = summarizeSessionText(session.firstUserMessage, 'New Session');
     }
 
     // Filter out sessions that contain JSON responses (Task Master errors)
@@ -1724,11 +1706,38 @@ function isVisibleCodexUserMessage(payload) {
     return false;
   }
 
-  if (typeof payload.message !== 'string' || payload.message.trim().length === 0) {
+  if (!extractMeaningfulCodexUserMessage(payload.message)) {
     return false;
   }
   
   return true;
+}
+
+function extractMeaningfulCodexUserMessage(message) {
+  if (typeof message !== 'string') {
+    return '';
+  }
+
+  const normalizedMessage = message.replace(/\r\n/g, '\n').trim();
+  if (!normalizedMessage) {
+    return '';
+  }
+
+  for (const marker of ['## My request for Codex:', '## My request:']) {
+    const markerIndex = normalizedMessage.indexOf(marker);
+    if (markerIndex >= 0) {
+      const extractedRequest = normalizedMessage.slice(markerIndex + marker.length).trim();
+      if (extractedRequest) {
+        return extractedRequest;
+      }
+    }
+  }
+
+  if (normalizedMessage.startsWith('# Context from my IDE setup:')) {
+    return '';
+  }
+
+  return normalizedMessage;
 }
 
 // Parse a Codex session JSONL file to extract metadata
@@ -1742,7 +1751,7 @@ async function parseCodexSessionFile(filePath) {
 
     let sessionMeta = null;
     let lastTimestamp = null;
-    let lastUserMessage = null;
+    let firstUserMessage = null;
     let messageCount = 0;
 
     for await (const line of rl) {
@@ -1766,11 +1775,12 @@ async function parseCodexSessionFile(filePath) {
             };
           }
 
-          // Count visible user messages and extract summary from the latest plain user input.
+          // Use the first visible user message as the stable auto title.
           if (entry.type === 'event_msg' && isVisibleCodexUserMessage(entry.payload)) {
             messageCount++;
-            if (entry.payload.message) {
-              lastUserMessage = entry.payload.message;
+            const visibleUserMessage = extractMeaningfulCodexUserMessage(entry.payload.message);
+            if (visibleUserMessage && !firstUserMessage) {
+              firstUserMessage = visibleUserMessage;
             }
           }
 
@@ -1788,9 +1798,7 @@ async function parseCodexSessionFile(filePath) {
       return {
         ...sessionMeta,
         timestamp: lastTimestamp || sessionMeta.timestamp,
-        summary: lastUserMessage ?
-          (lastUserMessage.length > 50 ? lastUserMessage.substring(0, 50) + '...' : lastUserMessage) :
-          'Codex Session',
+        summary: summarizeSessionText(firstUserMessage, 'Codex Session'),
         messageCount
       };
     }
@@ -2257,7 +2265,7 @@ async function searchConversations(query, limit = 50, onProjectResult = null, si
         const sessionMatches = new Map();
         const sessionSummaries = new Map();
         const pendingSummaries = new Map();
-        const sessionLastMessages = new Map();
+      const sessionFirstMessages = new Map();
         let currentSessionId = null;
 
         try {
@@ -2284,30 +2292,34 @@ async function searchConversations(query, limit = 50, onProjectResult = null, si
             if (entry.type === 'summary' && entry.summary) {
               const sid = entry.sessionId || currentSessionId;
               if (sid) {
-                sessionSummaries.set(sid, entry.summary);
+                if (!sessionSummaries.has(sid)) {
+                  sessionSummaries.set(sid, entry.summary);
+                }
               } else if (entry.leafUuid) {
-                pendingSummaries.set(entry.leafUuid, entry.summary);
+                if (!pendingSummaries.has(entry.leafUuid)) {
+                  pendingSummaries.set(entry.leafUuid, entry.summary);
+                }
               }
             }
 
-            // Apply pending summary via parentUuid
+            // Keep only the earliest fallback summary for sessions without visible user text.
             if (entry.parentUuid && currentSessionId && !sessionSummaries.has(currentSessionId)) {
               const pending = pendingSummaries.get(entry.parentUuid);
               if (pending) sessionSummaries.set(currentSessionId, pending);
             }
 
-            // Track last user/assistant message for fallback title
+            // Track the first visible user/assistant message for fallback title.
             if (entry.message?.content && currentSessionId && !entry.isApiErrorMessage) {
               const role = entry.message.role;
               if (role === 'user' || role === 'assistant') {
                 const text = extractText(entry.message.content);
                 if (text && !isSystemMessage(text)) {
-                  if (!sessionLastMessages.has(currentSessionId)) {
-                    sessionLastMessages.set(currentSessionId, {});
+                  if (!sessionFirstMessages.has(currentSessionId)) {
+                    sessionFirstMessages.set(currentSessionId, {});
                   }
-                  const msgs = sessionLastMessages.get(currentSessionId);
-                  if (role === 'user') msgs.user = text;
-                  else msgs.assistant = text;
+                  const msgs = sessionFirstMessages.get(currentSessionId);
+                  if (role === 'user' && !msgs.user) msgs.user = text;
+                  else if (role === 'assistant' && !msgs.assistant) msgs.assistant = text;
                 }
               }
             }
@@ -2346,14 +2358,11 @@ async function searchConversations(query, limit = 50, onProjectResult = null, si
         }
 
         for (const [sessionId, matches] of sessionMatches) {
+          const firstMessages = sessionFirstMessages.get(sessionId);
           projectResult.sessions.push({
             sessionId,
             provider: 'claude',
-            sessionSummary: sessionSummaries.get(sessionId) || (() => {
-              const msgs = sessionLastMessages.get(sessionId);
-              const lastMsg = msgs?.user || msgs?.assistant;
-              return lastMsg ? (lastMsg.length > 50 ? lastMsg.substring(0, 50) + '...' : lastMsg) : 'New Session';
-            })(),
+            sessionSummary: summarizeSessionText(firstMessages?.user, 'New Session'),
             matches
           });
         }
@@ -2445,7 +2454,7 @@ async function searchCodexSessionsForProject(
       // Second pass: re-read file to find matching messages
       const fileStream2 = fsSync.createReadStream(filePath);
       const rl2 = readline.createInterface({ input: fileStream2, crlfDelay: Infinity });
-      let lastUserMessage = null;
+      let firstUserMessage = null;
       const matches = [];
 
       for await (const line of rl2) {
@@ -2461,7 +2470,8 @@ async function searchCodexSessionsForProject(
         if (entry.type === 'event_msg' && entry.payload?.type === 'user_message' && entry.payload.message) {
           text = entry.payload.message;
           role = 'user';
-          lastUserMessage = text;
+          const visibleUserMessage = extractMeaningfulCodexUserMessage(text);
+          if (visibleUserMessage && !firstUserMessage) firstUserMessage = visibleUserMessage;
         } else if (entry.type === 'response_item' && entry.payload?.type === 'message') {
           const contentParts = entry.payload.content || [];
           if (entry.payload.role === 'user') {
@@ -2470,7 +2480,8 @@ async function searchCodexSessionsForProject(
               .map(p => p.text)
               .join(' ');
             role = 'user';
-            if (text) lastUserMessage = text;
+            const visibleUserMessage = extractMeaningfulCodexUserMessage(text);
+            if (visibleUserMessage && !firstUserMessage) firstUserMessage = visibleUserMessage;
           } else if (entry.payload.role === 'assistant') {
             text = contentParts
               .filter(p => p.type === 'output_text' && p.text)
@@ -2495,9 +2506,7 @@ async function searchCodexSessionsForProject(
         projectResult.sessions.push({
           sessionId: sessionMeta.id,
           provider: 'codex',
-          sessionSummary: lastUserMessage
-            ? (lastUserMessage.length > 50 ? lastUserMessage.substring(0, 50) + '...' : lastUserMessage)
-            : 'Codex Session',
+          sessionSummary: summarizeSessionText(firstUserMessage, 'Codex Session'),
           matches
         });
       }

@@ -1,5 +1,11 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react';
 import { IS_PLATFORM } from '../../../constants/config';
+import {
+  applyLanguagePreference,
+  DEFAULT_LANGUAGE,
+  getStoredLanguagePreference,
+  isSupportedLanguage,
+} from '../../../i18n/config.js';
 import { api } from '../../../utils/api';
 import { clearDeviceSession, getDeviceIdentity, storeDeviceSession } from '../deviceTrust.js';
 import { AUTH_ERROR_MESSAGES } from '../constants';
@@ -15,6 +21,11 @@ import type {
 import { parseJsonSafely, resolveApiErrorMessage } from '../utils';
 
 const AuthContext = createContext<AuthContextValue | null>(null);
+
+type LanguagePreferencePayload = {
+  language?: string;
+  isExplicitlySet?: boolean;
+};
 
 export function useAuth(): AuthContextValue {
   const context = useContext(AuthContext);
@@ -61,6 +72,37 @@ export function AuthProvider({ children }: AuthProviderProps) {
     await checkOnboardingStatus();
   }, [checkOnboardingStatus]);
 
+  const syncLanguagePreference = useCallback(async () => {
+    const localLanguage = getStoredLanguagePreference();
+
+    try {
+      const response = await api.user.language();
+      if (!response.ok) {
+        throw new Error(`Language preference request failed with status ${response.status}`);
+      }
+
+      const payload = await parseJsonSafely<LanguagePreferencePayload>(response);
+      const payloadLanguage = payload?.language;
+      const serverLanguage = isSupportedLanguage(payloadLanguage) ? payloadLanguage : DEFAULT_LANGUAGE;
+      const hasExplicitServerLanguage = payload?.isExplicitlySet === true;
+
+      if (!hasExplicitServerLanguage && localLanguage && localLanguage !== serverLanguage) {
+        const updateResponse = await api.user.updateLanguage(localLanguage);
+        if (!updateResponse.ok) {
+          throw new Error(`Language preference update failed with status ${updateResponse.status}`);
+        }
+
+        await applyLanguagePreference(localLanguage);
+        return;
+      }
+
+      await applyLanguagePreference(serverLanguage);
+    } catch (caughtError) {
+      console.error('[Auth] Language preference sync failed:', caughtError);
+      await applyLanguagePreference(localLanguage ?? DEFAULT_LANGUAGE);
+    }
+  }, []);
+
   const checkAuthStatus = useCallback(async () => {
     try {
       setIsLoading(true);
@@ -88,6 +130,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
         return;
       }
 
+      await syncLanguagePreference();
       setUser(userPayload.user);
       await checkOnboardingStatus();
     } catch (caughtError) {
@@ -96,7 +139,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
     } finally {
       setIsLoading(false);
     }
-  }, [checkOnboardingStatus, clearSession]);
+  }, [checkOnboardingStatus, clearSession, syncLanguagePreference]);
 
   useEffect(() => {
     if (IS_PLATFORM) {
@@ -139,6 +182,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
             deviceId: getDeviceIdentity().deviceId,
           });
         }
+        await syncLanguagePreference();
         setSession(payload.user);
         setNeedsSetup(false);
         await checkOnboardingStatus();
@@ -149,7 +193,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
         return { success: false, error: AUTH_ERROR_MESSAGES.networkError };
       }
     },
-    [checkOnboardingStatus, setSession],
+    [checkOnboardingStatus, setSession, syncLanguagePreference],
   );
 
   const register = useCallback<AuthContextValue['register']>(
@@ -172,6 +216,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
             deviceId: getDeviceIdentity().deviceId,
           });
         }
+        await syncLanguagePreference();
         setSession(payload.user);
         setNeedsSetup(false);
         await checkOnboardingStatus();
@@ -182,7 +227,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
         return { success: false, error: AUTH_ERROR_MESSAGES.networkError };
       }
     },
-    [checkOnboardingStatus, setSession],
+    [checkOnboardingStatus, setSession, syncLanguagePreference],
   );
 
   const logout = useCallback(() => {

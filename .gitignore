@@ -18,6 +18,7 @@ dist/
 # Local environment files
 .env
 !.env.example
+config/mobile-projects.json
 
 # Node install cache
 node_modules/
@@ -25,3 +26,5 @@ node_modules/
 # Windows extras
 Thumbs.db
 Desktop.ini
+/.tools/nginx-1.28.2
+/.workflow

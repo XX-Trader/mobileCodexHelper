@@ -24,6 +24,7 @@ The screenshot below shows the Windows desktop control tool:
 - view Codex projects and sessions from a phone browser
 - send messages from the phone to continue controlling Codex on the PC
 - require desktop approval before a new device can log in
+- keep the UI language in sync across desktop and mobile, with Simplified Chinese as the default
 - provide a Windows desktop tool to monitor:
   - local service health
   - remote publish state

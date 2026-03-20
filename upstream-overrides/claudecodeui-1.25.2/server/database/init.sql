@@ -11,7 +11,8 @@ CREATE TABLE IF NOT EXISTS users (
     is_active BOOLEAN DEFAULT 1,
     git_name TEXT,
     git_email TEXT,
-    has_completed_onboarding BOOLEAN DEFAULT 0
+    has_completed_onboarding BOOLEAN DEFAULT 0,
+    preferred_language TEXT DEFAULT 'zh-CN'
 );
 
 -- Indexes for performance
@@ -63,6 +64,19 @@ CREATE TABLE IF NOT EXISTS session_names (
 );
 
 CREATE INDEX IF NOT EXISTS idx_session_names_lookup ON session_names(session_id, provider);
+
+-- Session auto titles (first visible user message persisted for stable loading)
+CREATE TABLE IF NOT EXISTS session_auto_titles (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL,
+    provider TEXT NOT NULL DEFAULT 'claude',
+    auto_title TEXT NOT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(session_id, provider)
+);
+
+CREATE INDEX IF NOT EXISTS idx_session_auto_titles_lookup ON session_auto_titles(session_id, provider);
 
 -- Approved devices (browser/app wrappers) that are allowed to log in for this single-user system
 CREATE TABLE IF NOT EXISTS trusted_devices (

@@ -1,6 +1,6 @@
 import { Check, Clock, Edit2, Trash2, X } from 'lucide-react';
 import type { TFunction } from 'i18next';
-import { Badge, Button } from '../../../../shared/view/ui';
+import { Button } from '../../../../shared/view/ui';
 import { cn } from '../../../../lib/utils';
 import { IS_CODEX_ONLY_HARDENED } from '../../../../constants/config';
 import { formatTimeAgo } from '../../../../utils/dateUtils';
@@ -13,6 +13,8 @@ type SidebarSessionItemProps = {
   project: Project;
   session: SessionWithProvider;
   selectedSession: ProjectSession | null;
+  needsAttentionProcessing: boolean;
+  hasUnreadCompleted: boolean;
   currentTime: Date;
   editingSession: string | null;
   editingSessionName: string;
@@ -35,6 +37,8 @@ export default function SidebarSessionItem({
   project,
   session,
   selectedSession,
+  needsAttentionProcessing,
+  hasUnreadCompleted,
   currentTime,
   editingSession,
   editingSessionName,
@@ -49,6 +53,8 @@ export default function SidebarSessionItem({
 }: SidebarSessionItemProps) {
   const sessionView = createSessionViewModel(session, currentTime, t);
   const isSelected = selectedSession?.id === session.id;
+  const hasStatusIndicator = needsAttentionProcessing || hasUnreadCompleted;
+  const statusIndicatorClassName = hasUnreadCompleted ? 'bg-red-500' : 'bg-emerald-500';
 
   const selectMobileSession = () => {
     onProjectSelect(project);
@@ -65,9 +71,15 @@ export default function SidebarSessionItem({
 
   return (
     <div className="group relative">
-      {sessionView.isActive && (
+      {hasStatusIndicator && (
         <div className="absolute left-0 top-1/2 -translate-x-1 -translate-y-1/2 transform">
-          <div className="h-2 w-2 animate-pulse rounded-full bg-green-500" />
+          <div
+            className={cn(
+              'h-2 w-2 rounded-full',
+              statusIndicatorClassName,
+              needsAttentionProcessing && !hasUnreadCompleted && 'animate-pulse',
+            )}
+          />
         </div>
       )}
 
@@ -76,7 +88,9 @@ export default function SidebarSessionItem({
           className={cn(
             'p-2 mx-3 my-0.5 rounded-md bg-card border active:scale-[0.98] transition-all duration-150 relative',
             isSelected ? 'bg-primary/5 border-primary/20' : '',
-            !isSelected && sessionView.isActive
+            !isSelected && hasUnreadCompleted
+              ? 'border-red-500/30 bg-red-50/5 dark:bg-red-900/5'
+              : !isSelected && needsAttentionProcessing
               ? 'border-green-500/30 bg-green-50/5 dark:bg-green-900/5'
               : 'border-border/30',
           )}
@@ -99,11 +113,6 @@ export default function SidebarSessionItem({
                 <span className="text-xs text-muted-foreground">
                   {formatTimeAgo(sessionView.sessionTime, currentTime, t)}
                 </span>
-                {sessionView.messageCount > 0 && (
-                  <Badge variant="secondary" className="ml-auto px-1 py-0 text-xs">
-                    {sessionView.messageCount}
-                  </Badge>
-                )}
                 <span className="ml-1 opacity-70">
                   <SessionProviderLogo provider={session.__provider} className="h-3 w-3" />
                 </span>
@@ -131,6 +140,8 @@ export default function SidebarSessionItem({
           className={cn(
             'w-full justify-start p-2 h-auto font-normal text-left hover:bg-accent/50 transition-colors duration-200',
             isSelected && 'bg-accent text-accent-foreground',
+            !isSelected && hasUnreadCompleted && 'bg-red-50/40 dark:bg-red-900/10',
+            !isSelected && !hasUnreadCompleted && needsAttentionProcessing && 'bg-emerald-50/40 dark:bg-emerald-900/10',
           )}
           onClick={() => onSessionSelect(session, project.name)}
         >
@@ -143,15 +154,7 @@ export default function SidebarSessionItem({
                 <span className="text-xs text-muted-foreground">
                   {formatTimeAgo(sessionView.sessionTime, currentTime, t)}
                 </span>
-                {sessionView.messageCount > 0 && (
-                  <Badge
-                    variant="secondary"
-                    className="ml-auto px-1 py-0 text-xs transition-opacity group-hover:opacity-0"
-                  >
-                    {sessionView.messageCount}
-                  </Badge>
-                )}
-                <span className="ml-1 opacity-70 transition-opacity group-hover:opacity-0">
+                <span className="ml-1 opacity-70">
                   <SessionProviderLogo provider={session.__provider} className="h-3 w-3" />
                 </span>
               </div>

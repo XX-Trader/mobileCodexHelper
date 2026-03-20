@@ -2,11 +2,10 @@ import React from "react";
 import { Check, ChevronDown } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import SessionProviderLogo from "../../../llm-logo-provider/SessionProviderLogo";
-import { IS_CODEX_ONLY_HARDENED } from "../../../../constants/config";
+import { CODEX_CHAT_MODELS, IS_CODEX_ONLY_HARDENED } from "../../../../constants/config";
 import {
   CLAUDE_MODELS,
   CURSOR_MODELS,
-  CODEX_MODELS,
   GEMINI_MODELS,
 } from "../../../../../shared/modelConstants";
 import type { ProjectSession, SessionProvider } from "../../../../types/app";
@@ -78,7 +77,7 @@ const PROVIDERS: ProviderDef[] = [
 
 function getModelConfig(p: SessionProvider) {
   if (p === "claude") return CLAUDE_MODELS;
-  if (p === "codex") return CODEX_MODELS;
+  if (p === "codex") return CODEX_CHAT_MODELS;
   if (p === "gemini") return GEMINI_MODELS;
   return CURSOR_MODELS;
 }
@@ -180,7 +179,7 @@ export default function ProviderSelectionEmptyState({
                   }}
                   className="cursor-pointer appearance-none rounded-lg border border-border/60 bg-muted/50 py-1.5 pl-3 pr-7 text-sm font-medium text-foreground transition-colors hover:bg-muted focus:outline-none focus:ring-2 focus:ring-primary/20"
                 >
-                  {CODEX_MODELS.OPTIONS.map(({ value, label }) => (
+                  {CODEX_CHAT_MODELS.OPTIONS.map(({ value, label }) => (
                     <option key={value + label} value={value}>
                       {label}
                     </option>

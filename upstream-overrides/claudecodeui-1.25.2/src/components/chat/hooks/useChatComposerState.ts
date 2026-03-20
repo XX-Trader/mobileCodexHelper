@@ -14,7 +14,11 @@ import { authenticatedFetch } from '../../../utils/api';
 import { IS_CODEX_ONLY_HARDENED } from '../../../constants/config';
 import { thinkingModes } from '../constants/thinkingModes';
 import { grantClaudeToolPermission } from '../utils/chatPermissions';
-import { safeLocalStorage } from '../utils/chatStorage';
+import {
+  getChatDraftStorageKey,
+  safeLocalStorage,
+  type ChatDraftSnapshot,
+} from '../utils/chatStorage';
 import type {
   ChatMessage,
   PendingPermissionRequest,
@@ -40,6 +44,7 @@ interface UseChatComposerStateArgs {
   cursorModel: string;
   claudeModel: string;
   codexModel: string;
+  codexReasoningEffort: string;
   geminiModel: string;
   isLoading: boolean;
   canAbortSession: boolean;
@@ -83,6 +88,30 @@ const createFakeSubmitEvent = () => {
 const isTemporarySessionId = (sessionId: string | null | undefined) =>
   Boolean(sessionId && sessionId.startsWith('new-session-'));
 
+const readDraftSnapshot = (storageKey: string | null): ChatDraftSnapshot | null => {
+  if (!storageKey) {
+    return null;
+  }
+
+  const saved = safeLocalStorage.getItem(storageKey);
+  if (!saved) {
+    return null;
+  }
+
+  try {
+    const parsed = JSON.parse(saved) as ChatDraftSnapshot;
+    return {
+      input: typeof parsed.input === 'string' ? parsed.input : '',
+      thinkingMode: typeof parsed.thinkingMode === 'string' ? parsed.thinkingMode : 'none',
+      updatedAt: Number.isFinite(parsed.updatedAt) ? parsed.updatedAt : Date.now(),
+    };
+  } catch (error) {
+    console.error('Failed to parse draft snapshot, resetting:', error);
+    safeLocalStorage.removeItem(storageKey);
+    return null;
+  }
+};
+
 export function useChatComposerState({
   selectedProject,
   selectedSession,
@@ -93,6 +122,7 @@ export function useChatComposerState({
   cursorModel,
   claudeModel,
   codexModel,
+  codexReasoningEffort,
   geminiModel,
   isLoading,
   canAbortSession,
@@ -114,17 +144,19 @@ export function useChatComposerState({
   setIsUserScrolledUp,
   setPendingPermissionRequests,
 }: UseChatComposerStateArgs) {
-  const [input, setInput] = useState(() => {
-    if (typeof window !== 'undefined' && selectedProject) {
-      return safeLocalStorage.getItem(`draft_input_${selectedProject.name}`) || '';
-    }
-    return '';
+  const draftStorageKey = getChatDraftStorageKey({
+    projectName: selectedProject?.name,
+    sessionId: selectedSession?.id || currentSessionId,
+    provider: selectedSession?.__provider || provider,
   });
+  const initialDraftSnapshot =
+    typeof window !== 'undefined' ? readDraftSnapshot(draftStorageKey) : null;
+  const [input, setInput] = useState(() => initialDraftSnapshot?.input || '');
   const [attachedImages, setAttachedImages] = useState<File[]>([]);
   const [uploadingImages, setUploadingImages] = useState<Map<string, number>>(new Map());
   const [imageErrors, setImageErrors] = useState<Map<string, string>>(new Map());
   const [isTextareaExpanded, setIsTextareaExpanded] = useState(false);
-  const [thinkingMode, setThinkingMode] = useState('none');
+  const [thinkingMode, setThinkingMode] = useState(() => initialDraftSnapshot?.thinkingMode || 'none');
 
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const inputHighlightRef = useRef<HTMLDivElement>(null);
@@ -635,7 +667,8 @@ export function useChatComposerState({
             sessionId: effectiveSessionId,
             resume: Boolean(effectiveSessionId),
             model: codexModel,
-            permissionMode: permissionMode === 'plan' ? 'default' : permissionMode,
+            permissionMode,
+            modelReasoningEffort: codexReasoningEffort,
           },
         });
       } else if (provider === 'gemini') {
@@ -683,7 +716,9 @@ export function useChatComposerState({
         textareaRef.current.style.height = 'auto';
       }
 
-      safeLocalStorage.removeItem(`draft_input_${selectedProject.name}`);
+      if (draftStorageKey) {
+        safeLocalStorage.removeItem(draftStorageKey);
+      }
     },
     [
       attachedImages,
@@ -710,6 +745,7 @@ export function useChatComposerState({
       setIsLoading,
       setIsUserScrolledUp,
       slashCommands,
+      draftStorageKey,
       thinkingMode,
     ],
   );
@@ -723,27 +759,37 @@ export function useChatComposerState({
   }, [input]);
 
   useEffect(() => {
-    if (!selectedProject) {
-      return;
-    }
-    const savedInput = safeLocalStorage.getItem(`draft_input_${selectedProject.name}`) || '';
+    const snapshot = readDraftSnapshot(draftStorageKey);
+    const nextInput = snapshot?.input || '';
+    const nextThinkingMode = snapshot?.thinkingMode || 'none';
+
     setInput((previous) => {
-      const next = previous === savedInput ? previous : savedInput;
-      inputValueRef.current = next;
-      return next;
+      const resolved = previous === nextInput ? previous : nextInput;
+      inputValueRef.current = resolved;
+      return resolved;
     });
-  }, [selectedProject?.name]);
+    setThinkingMode((previous) => (previous === nextThinkingMode ? previous : nextThinkingMode));
+    setAttachedImages([]);
+    setUploadingImages(new Map());
+    setImageErrors(new Map());
+  }, [draftStorageKey]);
 
   useEffect(() => {
-    if (!selectedProject) {
+    if (!draftStorageKey) {
       return;
     }
-    if (input !== '') {
-      safeLocalStorage.setItem(`draft_input_${selectedProject.name}`, input);
+
+    if (input !== '' || thinkingMode !== 'none') {
+      const snapshot: ChatDraftSnapshot = {
+        input,
+        thinkingMode,
+        updatedAt: Date.now(),
+      };
+      safeLocalStorage.setItem(draftStorageKey, JSON.stringify(snapshot));
     } else {
-      safeLocalStorage.removeItem(`draft_input_${selectedProject.name}`);
+      safeLocalStorage.removeItem(draftStorageKey);
     }
-  }, [input, selectedProject]);
+  }, [draftStorageKey, input, thinkingMode]);
 
   useEffect(() => {
     if (!textareaRef.current) {
@@ -847,6 +893,46 @@ export function useChatComposerState({
     },
     [setCursorPosition, syncInputOverlayScroll],
   );
+
+  const insertTextAtCursor = useCallback(
+    (textToInsert: string) => {
+      const textarea = textareaRef.current;
+      const currentValue = inputValueRef.current;
+      const selectionStart = textarea?.selectionStart ?? currentValue.length;
+      const selectionEnd = textarea?.selectionEnd ?? currentValue.length;
+      const nextValue =
+        currentValue.slice(0, selectionStart) +
+        textToInsert +
+        currentValue.slice(selectionEnd);
+
+      setInput(nextValue);
+      inputValueRef.current = nextValue;
+
+      window.setTimeout(() => {
+        if (!textareaRef.current) {
+          return;
+        }
+
+        const nextCursorPosition = selectionStart + textToInsert.length;
+        textareaRef.current.focus();
+        textareaRef.current.selectionStart = nextCursorPosition;
+        textareaRef.current.selectionEnd = nextCursorPosition;
+        textareaRef.current.style.height = 'auto';
+        textareaRef.current.style.height = `${textareaRef.current.scrollHeight}px`;
+        syncInputOverlayScroll(textareaRef.current);
+        setCursorPosition(nextCursorPosition);
+
+        const lineHeight = parseInt(window.getComputedStyle(textareaRef.current).lineHeight);
+        setIsTextareaExpanded(textareaRef.current.scrollHeight > lineHeight * 2);
+      }, 0);
+    },
+    [setCursorPosition, syncInputOverlayScroll],
+  );
+
+  const handleInsertSupplementBlock = useCallback(() => {
+    const prefix = inputValueRef.current.trim().length > 0 ? '\n\n' : '';
+    insertTextAtCursor(`${prefix}补充信息：\n- `);
+  }, [insertTextAtCursor]);
 
   const handleClearInput = useCallback(() => {
     setInput('');
@@ -1010,6 +1096,7 @@ export function useChatComposerState({
     handleTextareaClick,
     handleTextareaInput,
     syncInputOverlayScroll,
+    handleInsertSupplementBlock,
     handleClearInput,
     handleAbortSession,
     handleTranscript,

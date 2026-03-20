@@ -23,6 +23,9 @@ type FetchProjectsOptions = {
   showLoadingState?: boolean;
 };
 
+const RECENT_SESSION_STORAGE_KEY = 'recentSessionIds';
+const MAX_RECENT_SESSIONS = 6;
+
 const serialize = (value: unknown) => JSON.stringify(value ?? null);
 
 const projectsHaveChanges = (
@@ -75,6 +78,35 @@ const getProjectSessions = (project: Project): ProjectSession[] => {
     ...(project.cursorSessions ?? []),
     ...(project.geminiSessions ?? []),
   ];
+};
+
+const findProjectSessionById = (
+  project: Project,
+  targetSessionId: string,
+): { session: ProjectSession; provider: 'claude' | 'codex' | 'cursor' | 'gemini' } | null => {
+  const codexSession = project.codexSessions?.find((session) => session.id === targetSessionId);
+  if (codexSession) {
+    return { session: codexSession, provider: 'codex' };
+  }
+
+  if (!IS_CODEX_ONLY_HARDENED) {
+    const claudeSession = project.sessions?.find((session) => session.id === targetSessionId);
+    if (claudeSession) {
+      return { session: claudeSession, provider: 'claude' };
+    }
+
+    const cursorSession = project.cursorSessions?.find((session) => session.id === targetSessionId);
+    if (cursorSession) {
+      return { session: cursorSession, provider: 'cursor' };
+    }
+
+    const geminiSession = project.geminiSessions?.find((session) => session.id === targetSessionId);
+    if (geminiSession) {
+      return { session: geminiSession, provider: 'gemini' };
+    }
+  }
+
+  return null;
 };
 
 const isUpdateAdditive = (
@@ -133,6 +165,24 @@ const readPersistedTab = (): AppTab => {
   return 'chat';
 };
 
+const readRecentSessionIds = (): string[] => {
+  try {
+    const raw = localStorage.getItem(RECENT_SESSION_STORAGE_KEY);
+    if (!raw) {
+      return [];
+    }
+
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) {
+      return [];
+    }
+
+    return parsed.filter((sessionId): sessionId is string => typeof sessionId === 'string' && sessionId.length > 0);
+  } catch {
+    return [];
+  }
+};
+
 export function useProjectsState({
   sessionId,
   navigate,
@@ -144,6 +194,7 @@ export function useProjectsState({
   const [selectedProject, setSelectedProject] = useState<Project | null>(null);
   const [selectedSession, setSelectedSession] = useState<ProjectSession | null>(null);
   const [activeTab, setActiveTab] = useState<AppTab>(readPersistedTab);
+  const [recentSessionIds, setRecentSessionIds] = useState<string[]>(readRecentSessionIds);
 
   useEffect(() => {
     try {
@@ -152,6 +203,14 @@ export function useProjectsState({
       // Silently ignore storage errors
     }
   }, [activeTab]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(RECENT_SESSION_STORAGE_KEY, JSON.stringify(recentSessionIds));
+    } catch {
+      // localStorage unavailable
+    }
+  }, [recentSessionIds]);
 
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [isLoadingProjects, setIsLoadingProjects] = useState(true);
@@ -162,6 +221,26 @@ export function useProjectsState({
   const [externalMessageUpdate, setExternalMessageUpdate] = useState(0);
 
   const loadingProgressTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const recordRecentSession = useCallback((sessionId?: string | null) => {
+    if (!sessionId) {
+      return;
+    }
+
+    setRecentSessionIds((previous) => {
+      if (previous.includes(sessionId)) {
+        return previous;
+      }
+
+      return [...previous, sessionId].slice(-MAX_RECENT_SESSIONS);
+    });
+  }, []);
+
+  const dismissRecentSession = useCallback((sessionIdToDismiss: string) => {
+    setRecentSessionIds((previous) =>
+      previous.filter((existingSessionId) => existingSessionId !== sessionIdToDismiss),
+    );
+  }, []);
 
   const fetchProjects = useCallback(async ({ showLoadingState = true }: FetchProjectsOptions = {}) => {
     try {
@@ -263,14 +342,10 @@ export function useProjectsState({
 
     const updatedProjects = projectsMessage.projects;
 
-    if (
-      hasActiveSession &&
-      !isUpdateAdditive(projects, updatedProjects, selectedProject, selectedSession)
-    ) {
-      return;
-    }
-
     setProjects(updatedProjects);
+    const shouldPreserveSelectedSessionSelection =
+      hasActiveSession &&
+      !isUpdateAdditive(projects, updatedProjects, selectedProject, selectedSession);
 
     if (!selectedProject) {
       return;
@@ -298,6 +373,19 @@ export function useProjectsState({
 
     if (!updatedSelectedSession) {
       setSelectedSession(null);
+      return;
+    }
+
+    const normalizedUpdatedSelectedSession =
+      updatedSelectedSession.__provider || !selectedSession.__provider
+        ? updatedSelectedSession
+        : { ...updatedSelectedSession, __provider: selectedSession.__provider };
+
+    if (
+      !shouldPreserveSelectedSessionSelection &&
+      serialize(normalizedUpdatedSelectedSession) !== serialize(selectedSession)
+    ) {
+      setSelectedSession(normalizedUpdatedSelectedSession);
     }
   }, [latestMessage, selectedProject, selectedSession, activeSessions, projects]);
 
@@ -382,6 +470,12 @@ export function useProjectsState({
     }
   }, [sessionId, projects, selectedProject?.name, selectedSession?.id, selectedSession?.__provider]);
 
+  useEffect(() => {
+    if (selectedSession?.id) {
+      recordRecentSession(selectedSession.id);
+    }
+  }, [recordRecentSession, selectedSession?.id]);
+
   const handleProjectSelect = useCallback(
     (project: Project) => {
       setSelectedProject(project);
@@ -398,6 +492,7 @@ export function useProjectsState({
   const handleSessionSelect = useCallback(
     (session: ProjectSession) => {
       setSelectedSession(session);
+      recordRecentSession(session.id);
 
       if (activeTab === 'tasks' || activeTab === 'preview') {
         setActiveTab('chat');
@@ -418,7 +513,7 @@ export function useProjectsState({
 
       navigate(`/session/${session.id}`);
     },
-    [activeTab, isMobile, navigate, selectedProject?.name],
+    [activeTab, isMobile, navigate, recordRecentSession, selectedProject?.name],
   );
 
   const handleNewSession = useCallback(
@@ -442,11 +537,15 @@ export function useProjectsState({
         navigate('/');
       }
 
+      dismissRecentSession(sessionIdToDelete);
+
       setProjects((prevProjects) =>
         prevProjects.map((project) => ({
           ...project,
           sessions: project.sessions?.filter((session) => session.id !== sessionIdToDelete) ?? [],
           codexSessions: project.codexSessions?.filter((session) => session.id !== sessionIdToDelete) ?? [],
+          cursorSessions: project.cursorSessions?.filter((session) => session.id !== sessionIdToDelete) ?? [],
+          geminiSessions: project.geminiSessions?.filter((session) => session.id !== sessionIdToDelete) ?? [],
           sessionMeta: {
             ...project.sessionMeta,
             total: Math.max(0, (project.sessionMeta?.total as number | undefined ?? 0) - 1),
@@ -454,7 +553,7 @@ export function useProjectsState({
         })),
       );
     },
-    [navigate, selectedSession?.id],
+    [dismissRecentSession, navigate, selectedSession?.id],
   );
 
   const handleSidebarRefresh = useCallback(async () => {
@@ -516,6 +615,19 @@ export function useProjectsState({
     [navigate, selectedProject?.name],
   );
 
+  const handleProjectHide = useCallback(
+    (projectName: string) => {
+      if (selectedProject?.name === projectName) {
+        setSelectedProject(null);
+        setSelectedSession(null);
+        navigate('/');
+      }
+
+      setProjects((prevProjects) => prevProjects.filter((project) => project.name !== projectName));
+    },
+    [navigate, selectedProject?.name],
+  );
+
   const sidebarSharedProps = useMemo(
     () => ({
       projects,
@@ -526,6 +638,7 @@ export function useProjectsState({
       onNewSession: handleNewSession,
       onSessionDelete: handleSessionDelete,
       onProjectDelete: handleProjectDelete,
+      onProjectHide: handleProjectHide,
       isLoading: isLoadingProjects,
       loadingProgress,
       onRefresh: handleSidebarRefresh,
@@ -538,6 +651,7 @@ export function useProjectsState({
     [
       handleNewSession,
       handleProjectDelete,
+      handleProjectHide,
       handleProjectSelect,
       handleSessionDelete,
       handleSessionSelect,
@@ -553,8 +667,35 @@ export function useProjectsState({
     ],
   );
 
+  const recentSessions = useMemo(() => {
+    const sessionEntries = recentSessionIds
+      .map((recentSessionId) => {
+        for (const project of projects) {
+          const match = findProjectSessionById(project, recentSessionId);
+          if (!match) {
+            continue;
+          }
+
+          return {
+            sessionId: match.session.id,
+            sessionTitle: match.session.title || match.session.summary || match.session.name || 'Untitled session',
+            projectName: project.displayName,
+            provider: match.provider,
+            isProcessing: false,
+            hasUnread: false,
+          };
+        }
+
+        return null;
+      })
+      .filter((entry): entry is NonNullable<typeof entry> => Boolean(entry));
+
+    return sessionEntries;
+  }, [projects, recentSessionIds]);
+
   return {
     projects,
+    recentSessions,
     selectedProject,
     selectedSession,
     activeTab,
@@ -576,8 +717,10 @@ export function useProjectsState({
     handleProjectSelect,
     handleSessionSelect,
     handleNewSession,
+    dismissRecentSession,
     handleSessionDelete,
     handleProjectDelete,
+    handleProjectHide,
     handleSidebarRefresh,
   };
 }

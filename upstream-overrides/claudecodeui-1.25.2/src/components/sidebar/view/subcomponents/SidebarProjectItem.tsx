@@ -13,6 +13,8 @@ type SidebarProjectItemProps = {
   project: Project;
   selectedProject: Project | null;
   selectedSession: ProjectSession | null;
+  attentionProcessingSessions: Set<string>;
+  unreadCompletedSessions: Set<string>;
   isExpanded: boolean;
   isDeleting: boolean;
   isStarred: boolean;
@@ -34,6 +36,7 @@ type SidebarProjectItemProps = {
   onCancelEditingProject: () => void;
   onSaveProjectName: (projectName: string) => void;
   onDeleteProject: (project: Project) => void;
+  onHideProject?: (project: Project) => void;
   onSessionSelect: (session: SessionWithProvider, projectName: string) => void;
   onDeleteSession: (
     projectName: string,
@@ -59,10 +62,43 @@ const getSessionCountDisplay = (sessions: SessionWithProvider[], hasMoreSessions
   return `${sessionCount}`;
 };
 
+function StatusCountBadge({
+  color,
+  count,
+  title,
+}: {
+  color: 'green' | 'red';
+  count: number;
+  title: string;
+}) {
+  if (count <= 0) {
+    return null;
+  }
+
+  const colorClasses =
+    color === 'green'
+      ? 'border-emerald-200 bg-emerald-500/10 text-emerald-600 dark:border-emerald-900/60 dark:bg-emerald-500/15 dark:text-emerald-300'
+      : 'border-red-200 bg-red-500/10 text-red-600 dark:border-red-900/60 dark:bg-red-500/15 dark:text-red-300';
+
+  return (
+    <span
+      className={cn(
+        'inline-flex min-w-[20px] items-center justify-center rounded-full border px-1.5 py-0.5 text-[10px] font-semibold leading-none',
+        colorClasses,
+      )}
+      title={title}
+    >
+      {count}
+    </span>
+  );
+}
+
 export default function SidebarProjectItem({
   project,
   selectedProject,
   selectedSession,
+  attentionProcessingSessions,
+  unreadCompletedSessions,
   isExpanded,
   isDeleting,
   isStarred,
@@ -100,6 +136,8 @@ export default function SidebarProjectItem({
   const sessionCountDisplay = getSessionCountDisplay(sessions, hasMoreSessions);
   const sessionCountLabel = `${sessionCountDisplay} session${sessions.length === 1 ? '' : 's'}`;
   const taskStatus = getTaskIndicatorStatus(project, mcpServerStatus);
+  const processingAttentionCount = sessions.filter((session) => attentionProcessingSessions.has(session.id)).length;
+  const unreadCompletedCount = sessions.filter((session) => unreadCompletedSessions.has(session.id)).length;
 
   const toggleProject = () => onToggleProject(project.name);
   const toggleStarProject = () => onToggleStarProject(project.name);
@@ -173,17 +211,31 @@ export default function SidebarProjectItem({
                     />
                   ) : (
                     <>
-                      <div className="flex min-w-0 flex-1 items-center justify-between">
-                        <h3 className="truncate text-sm font-medium text-foreground">{project.displayName}</h3>
-                        {tasksEnabled && (
-                          <TaskIndicator
-                            status={taskStatus}
-                            size="xs"
-                            className="ml-2 hidden flex-shrink-0 md:inline-flex"
+                      <div className="flex min-w-0 flex-1 items-start justify-between gap-2">
+                        <div className="min-w-0 flex-1">
+                          <h3 className="truncate text-sm font-medium text-foreground">{project.displayName}</h3>
+                          <p className="text-xs text-muted-foreground">{sessionCountLabel}</p>
+                        </div>
+                        <div className="flex flex-shrink-0 items-center gap-1 pt-0.5">
+                          <StatusCountBadge
+                            color="green"
+                            count={processingAttentionCount}
+                            title="Sessions currently responding"
                           />
-                        )}
+                          <StatusCountBadge
+                            color="red"
+                            count={unreadCompletedCount}
+                            title="Sessions completed but not viewed"
+                          />
+                          {tasksEnabled && (
+                            <TaskIndicator
+                              status={taskStatus}
+                              size="xs"
+                              className="hidden flex-shrink-0 md:inline-flex"
+                            />
+                          )}
+                        </div>
                       </div>
-                      <p className="text-xs text-muted-foreground">{sessionCountLabel}</p>
                     </>
                   )}
                 </div>
@@ -316,17 +368,41 @@ export default function SidebarProjectItem({
                 </div>
               ) : (
                 <div>
-                  <div className="truncate text-sm font-semibold text-foreground" title={project.displayName}>
-                    {project.displayName}
-                  </div>
-                  <div className="text-xs text-muted-foreground">
-                    {sessionCountDisplay}
-                    {project.fullPath !== project.displayName && (
-                      <span className="ml-1 opacity-60" title={project.fullPath}>
-                        {' - '}
-                        {project.fullPath.length > 25 ? `...${project.fullPath.slice(-22)}` : project.fullPath}
-                      </span>
-                    )}
+                  <div className="flex min-w-0 items-start justify-between gap-2">
+                    <div className="min-w-0 flex-1">
+                      <div className="truncate text-sm font-semibold text-foreground" title={project.displayName}>
+                        {project.displayName}
+                      </div>
+                      <div className="text-xs text-muted-foreground">
+                        {sessionCountDisplay}
+                        {project.fullPath !== project.displayName && (
+                          <span className="ml-1 opacity-60" title={project.fullPath}>
+                            {' - '}
+                            {project.fullPath.length > 25 ? `...${project.fullPath.slice(-22)}` : project.fullPath}
+                          </span>
+                        )}
+                      </div>
+                    </div>
+
+                    <div className="flex flex-shrink-0 items-center gap-1 pl-2">
+                      <StatusCountBadge
+                        color="green"
+                        count={processingAttentionCount}
+                        title="Sessions currently responding"
+                      />
+                      <StatusCountBadge
+                        color="red"
+                        count={unreadCompletedCount}
+                        title="Sessions completed but not viewed"
+                      />
+                      {tasksEnabled && (
+                        <TaskIndicator
+                          status={taskStatus}
+                          size="xs"
+                          className="ml-1 flex-shrink-0"
+                        />
+                      )}
+                    </div>
                   </div>
                 </div>
               )}
@@ -417,6 +493,8 @@ export default function SidebarProjectItem({
         isExpanded={isExpanded}
         sessions={sessions}
         selectedSession={selectedSession}
+        attentionProcessingSessions={attentionProcessingSessions}
+        unreadCompletedSessions={unreadCompletedSessions}
         initialSessionsLoaded={initialSessionsLoaded}
         isLoadingSessions={isLoadingSessions}
         currentTime={currentTime}

@@ -222,6 +222,12 @@ export const api = {
         method: 'POST',
         body: JSON.stringify({ gitName, gitEmail }),
       }),
+    language: () => authenticatedFetch('/api/user/language'),
+    updateLanguage: (language) =>
+      authenticatedFetch('/api/user/language', {
+        method: 'PUT',
+        body: JSON.stringify({ language }),
+      }),
     onboardingStatus: () => authenticatedFetch('/api/user/onboarding-status'),
     completeOnboarding: () =>
       authenticatedFetch('/api/user/complete-onboarding', {

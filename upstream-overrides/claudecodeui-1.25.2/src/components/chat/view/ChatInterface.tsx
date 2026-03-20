@@ -39,6 +39,7 @@ function ChatInterface({
   autoScrollToBottom,
   sendByCtrlEnter,
   externalMessageUpdate,
+  selectedSessionHasUnread,
   onShowAllTasks,
 }: ChatInterfaceProps) {
   const { tasksEnabled, isTaskMasterInstalled } = useTasksSettings();
@@ -65,6 +66,8 @@ function ChatInterface({
     setClaudeModel,
     codexModel,
     setCodexModel,
+    codexReasoningEffort,
+    setCodexReasoningEffort,
     geminiModel,
     setGeminiModel,
     permissionMode,
@@ -72,6 +75,7 @@ function ChatInterface({
     setPendingPermissionRequests,
     cyclePermissionMode,
   } = useChatProviderState({
+    selectedProject,
     selectedSession,
   });
 
@@ -95,6 +99,7 @@ function ChatInterface({
     setIsUserScrolledUp,
     tokenBudget,
     setTokenBudget,
+    refreshTokenBudget,
     visibleMessageCount,
     visibleMessages,
     loadEarlierMessages,
@@ -118,6 +123,7 @@ function ChatInterface({
     sendMessage,
     autoScrollToBottom,
     externalMessageUpdate,
+    selectedSessionHasUnread,
     processingSessions,
     resetStreamingState,
     pendingViewSessionRef,
@@ -140,6 +146,7 @@ function ChatInterface({
     resetCommandMenuState,
     handleCommandSelect,
     handleToggleCommandMenu,
+    handleInsertSupplementBlock,
     showFileDropdown,
     filteredFiles,
     selectedFileIndex,
@@ -177,6 +184,7 @@ function ChatInterface({
     cursorModel,
     claudeModel,
     codexModel,
+    codexReasoningEffort,
     geminiModel,
     isLoading,
     canAbortSession,
@@ -228,6 +236,7 @@ function ChatInterface({
     setCanAbortSession,
     setClaudeStatus,
     setTokenBudget,
+    refreshTokenBudget,
     setIsSystemSessionChange,
     setPendingPermissionRequests,
     pendingViewSessionRef,
@@ -351,11 +360,14 @@ function ChatInterface({
           provider={provider}
           permissionMode={permissionMode}
           onModeSwitch={cyclePermissionMode}
+          codexReasoningEffort={codexReasoningEffort}
+          setCodexReasoningEffort={setCodexReasoningEffort}
           thinkingMode={thinkingMode}
           setThinkingMode={setThinkingMode}
           tokenBudget={tokenBudget}
           slashCommandsCount={slashCommandsCount}
           onToggleCommandMenu={handleToggleCommandMenu}
+          onInsertSupplementBlock={handleInsertSupplementBlock}
           hasInput={Boolean(input.trim())}
           onClearInput={handleClearInput}
           isUserScrolledUp={isUserScrolledUp}

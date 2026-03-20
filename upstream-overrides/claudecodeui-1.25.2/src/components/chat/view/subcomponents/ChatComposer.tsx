@@ -48,11 +48,14 @@ interface ChatComposerProps {
   provider: Provider | string;
   permissionMode: PermissionMode | string;
   onModeSwitch: () => void;
+  codexReasoningEffort: string;
+  setCodexReasoningEffort: Dispatch<SetStateAction<string>>;
   thinkingMode: string;
   setThinkingMode: Dispatch<SetStateAction<string>>;
   tokenBudget: { used?: number; total?: number } | null;
   slashCommandsCount: number;
   onToggleCommandMenu: () => void;
+  onInsertSupplementBlock: () => void;
   hasInput: boolean;
   onClearInput: () => void;
   isUserScrolledUp: boolean;
@@ -95,6 +98,13 @@ interface ChatComposerProps {
   onTranscript: (text: string) => void;
 }
 
+/**
+ * 渲染聊天输入区、权限提示与会话状态条，并协调移动端输入浮层行为。
+ *
+ * @param props 聊天输入、状态显示、权限处理与附件上传所需的全部交互参数。
+ * @returns 聊天底部编辑区；在移动端输入聚焦时会切换为浮动模式。
+ * @throws 不直接抛出异常；由事件处理器产生的异常向上交给 React 处理。
+ */
 export default function ChatComposer({
   pendingPermissionRequests,
   handlePermissionDecision,
@@ -105,11 +115,14 @@ export default function ChatComposer({
   provider,
   permissionMode,
   onModeSwitch,
+  codexReasoningEffort,
+  setCodexReasoningEffort,
   thinkingMode,
   setThinkingMode,
   tokenBudget,
   slashCommandsCount,
   onToggleCommandMenu,
+  onInsertSupplementBlock,
   hasInput,
   onClearInput,
   isUserScrolledUp,
@@ -164,15 +177,16 @@ export default function ChatComposer({
     (r) => r.toolName === 'AskUserQuestion'
   );
 
-  // On mobile, when input is focused, float the input box at the bottom
+  // Keep the composer in normal flow on mobile to avoid viewport-height reflow
+  // causing the chat list to jump when the keyboard opens or closes.
   const mobileFloatingClass = isInputFocused
-    ? 'max-sm:fixed max-sm:bottom-0 max-sm:left-0 max-sm:right-0 max-sm:z-50 max-sm:bg-background max-sm:shadow-[0_-4px_20px_rgba(0,0,0,0.15)]'
+    ? 'max-sm:bg-background/95 max-sm:backdrop-blur-sm'
     : '';
 
   return (
-    <div className={`flex-shrink-0 p-2 pb-2 sm:p-4 sm:pb-4 md:p-4 md:pb-6 ${mobileFloatingClass}`}>
+    <div className={`flex-shrink-0 px-2 pb-2 pt-1.5 sm:p-4 sm:pb-4 md:p-4 md:pb-6 ${mobileFloatingClass}`}>
       {!hasQuestionPanel && (
-        <div className="flex-1">
+        <div className="mx-auto mb-2 max-w-4xl sm:mb-3">
           <ClaudeStatus
             status={claudeStatus}
             isLoading={isLoading}
@@ -182,7 +196,7 @@ export default function ChatComposer({
         </div>
       )}
 
-      <div className="mx-auto mb-3 max-w-4xl">
+      <div className="mx-auto mb-2 max-w-4xl sm:mb-3">
         <PermissionRequestsBanner
           pendingPermissionRequests={pendingPermissionRequests}
           handlePermissionDecision={handlePermissionDecision}
@@ -193,11 +207,14 @@ export default function ChatComposer({
           permissionMode={permissionMode}
           onModeSwitch={onModeSwitch}
           provider={provider}
+          codexReasoningEffort={codexReasoningEffort}
+          setCodexReasoningEffort={setCodexReasoningEffort}
           thinkingMode={thinkingMode}
           setThinkingMode={setThinkingMode}
           tokenBudget={tokenBudget}
           slashCommandsCount={slashCommandsCount}
           onToggleCommandMenu={onToggleCommandMenu}
+          onInsertSupplementBlock={onInsertSupplementBlock}
           hasInput={hasInput}
           onClearInput={onClearInput}
           isUserScrolledUp={isUserScrolledUp}

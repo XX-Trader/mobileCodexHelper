@@ -23,11 +23,14 @@ function Sidebar({
   projects,
   selectedProject,
   selectedSession,
+  attentionProcessingSessions,
+  unreadCompletedSessions,
   onProjectSelect,
   onSessionSelect,
   onNewSession,
   onSessionDelete,
   onProjectDelete,
+  onProjectHide,
   isLoading,
   loadingProgress,
   onRefresh,
@@ -133,11 +136,19 @@ function Sidebar({
     window.location.reload();
   };
 
+  const handleProjectHide = onProjectHide
+    ? (project: Project) => {
+        onProjectHide(project.name);
+      }
+    : () => undefined;
+
   const projectListProps: SidebarProjectListProps = {
     projects,
     filteredProjects,
     selectedProject,
     selectedSession,
+    attentionProcessingSessions,
+    unreadCompletedSessions,
     isLoading,
     loadingProgress,
     expandedProjects,
@@ -163,6 +174,7 @@ function Sidebar({
       void saveProjectName(projectName);
     },
     onDeleteProject: requestProjectDelete,
+    onHideProject: handleProjectHide,
     onSessionSelect: handleSessionClick,
     onDeleteSession: showDeleteSessionConfirmation,
     onLoadMoreSessions: (project) => {
@@ -200,6 +212,11 @@ function Sidebar({
         sessionDeleteConfirmation={sessionDeleteConfirmation}
         onCancelDeleteSession={() => setSessionDeleteConfirmation(null)}
         onConfirmDeleteSession={confirmDeleteSession}
+        showHiddenProjects={false}
+        hiddenProjects={[]}
+        hiddenProjectNamesInFlight={new Set()}
+        onCloseHiddenProjects={() => undefined}
+        onRestoreHiddenProject={() => undefined}
         showVersionModal={showVersionModal}
         onCloseVersionModal={() => setShowVersionModal(false)}
         releaseInfo={releaseInfo}
@@ -264,6 +281,8 @@ function Sidebar({
             }}
             isRefreshing={isRefreshing}
             onCreateProject={() => setShowNewProject(true)}
+            hiddenProjectsCount={0}
+            onShowHiddenProjects={() => undefined}
             onCollapseSidebar={handleCollapseSidebar}
             updateAvailable={updateAvailable}
             releaseInfo={releaseInfo}

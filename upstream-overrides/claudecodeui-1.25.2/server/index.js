@@ -66,7 +66,7 @@ import codexRoutes from './routes/codex.js';
 import geminiRoutes from './routes/gemini.js';
 import pluginsRoutes from './routes/plugins.js';
 import { startEnabledPluginServers, stopAllPlugins } from './utils/plugin-process-manager.js';
-import { initializeDatabase, sessionNamesDb, applyCustomSessionNames } from './database/db.js';
+import { initializeDatabase, sessionNamesDb, sessionAutoTitlesDb, applyPersistedSessionTitles, applyCustomSessionNames } from './database/db.js';
 import { validateApiKey, authenticateToken, authenticateWebSocketRequest } from './middleware/auth.js';
 import { IS_PLATFORM } from './constants/config.js';
 
@@ -529,6 +529,7 @@ app.get('/api/projects/:projectName/sessions', authenticateToken, async (req, re
     try {
         const { limit = 5, offset = 0 } = req.query;
         const result = await getSessions(req.params.projectName, parseInt(limit), parseInt(offset));
+        applyPersistedSessionTitles(result.sessions, 'claude');
         applyCustomSessionNames(result.sessions, 'claude');
         res.json(result);
     } catch (error) {
@@ -591,6 +592,7 @@ app.delete('/api/projects/:projectName/sessions/:sessionId', authenticateToken, 
         console.log(`[API] Deleting session: ${sessionId} from project: ${projectName}`);
         await deleteSession(projectName, sessionId);
         sessionNamesDb.deleteName(sessionId, 'claude');
+        sessionAutoTitlesDb.deleteTitle(sessionId, 'claude');
         console.log(`[API] Session ${sessionId} deleted successfully`);
         res.json({ success: true });
     } catch (error) {
@@ -1039,12 +1041,61 @@ app.get('/api/projects/:projectName/files', authenticateToken, async (req, res) 
  * @param {string} targetPath - The path to validate
  * @returns {{ valid: boolean, resolved?: string, error?: string }}
  */
+function normalizeProjectScopedFilePath(targetPath) {
+    if (typeof targetPath !== 'string') {
+        return '';
+    }
+
+    const trimmedTargetPath = targetPath.trim();
+    if (!trimmedTargetPath) {
+        return '';
+    }
+
+    let decodedTargetPath = trimmedTargetPath;
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+        if (!decodedTargetPath.includes('%')) {
+            break;
+        }
+
+        try {
+            const nextValue = decodeURIComponent(decodedTargetPath);
+            if (nextValue === decodedTargetPath) {
+                break;
+            }
+            decodedTargetPath = nextValue;
+        } catch {
+            break;
+        }
+    }
+
+    if (process.platform === 'win32') {
+        const windowsDrivePathMatch = decodedTargetPath.match(/^\/([a-zA-Z]:[\\/].*)$/);
+        if (windowsDrivePathMatch) {
+            return windowsDrivePathMatch[1];
+        }
+
+        const unixDrivePathMatch = decodedTargetPath.match(/^\/([a-zA-Z])(\/.*)?$/);
+        if (unixDrivePathMatch) {
+            const driveLetter = unixDrivePathMatch[1].toUpperCase();
+            const restPath = (unixDrivePathMatch[2] || '/').replace(/\//g, '\\');
+            return `${driveLetter}:${restPath}`;
+        }
+    }
+
+    return decodedTargetPath;
+}
+
 function validatePathInProject(projectRoot, targetPath) {
-    const resolved = path.isAbsolute(targetPath)
-        ? path.resolve(targetPath)
-        : path.resolve(projectRoot, targetPath);
-    const normalizedRoot = path.resolve(projectRoot) + path.sep;
-    if (!resolved.startsWith(normalizedRoot)) {
+    const normalizedTargetPath = normalizeProjectScopedFilePath(targetPath);
+    if (!normalizedTargetPath) {
+        return { valid: false, error: 'Invalid file path' };
+    }
+
+    const resolved = path.isAbsolute(normalizedTargetPath)
+        ? path.resolve(normalizedTargetPath)
+        : path.resolve(projectRoot, normalizedTargetPath);
+    const normalizedRoot = path.resolve(projectRoot);
+    if (resolved !== normalizedRoot && !resolved.startsWith(`${normalizedRoot}${path.sep}`)) {
         return { valid: false, error: 'Path must be under project root' };
     }
     return { valid: true, resolved };
@@ -2352,6 +2403,15 @@ app.get('/api/projects/:projectName/sessions/:sessionId/token-usage', authentica
 
         // Handle Codex sessions
         if (provider === 'codex') {
+            if (safeSessionId.startsWith('codex-')) {
+                return res.json({
+                    used: 0,
+                    total: 200000,
+                    pending: true,
+                    message: 'Codex session is still being materialized'
+                });
+            }
+
             const codexSessionsDir = path.join(homeDir, '.codex', 'sessions');
 
             // Find the session file by searching for the session ID

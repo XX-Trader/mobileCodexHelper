@@ -1,6 +1,6 @@
 import React from 'react';
 import { useTranslation } from 'react-i18next';
-import { IS_CODEX_ONLY_HARDENED } from '../../../../constants/config';
+import { CODEX_REASONING_EFFORTS, IS_CODEX_ONLY_HARDENED } from '../../../../constants/config';
 import type { PermissionMode, Provider } from '../../types/types';
 import ThinkingModeSelector from './ThinkingModeSelector';
 import TokenUsagePie from './TokenUsagePie';
@@ -9,11 +9,14 @@ interface ChatInputControlsProps {
   permissionMode: PermissionMode | string;
   onModeSwitch: () => void;
   provider: Provider | string;
+  codexReasoningEffort: string;
+  setCodexReasoningEffort: React.Dispatch<React.SetStateAction<string>>;
   thinkingMode: string;
   setThinkingMode: React.Dispatch<React.SetStateAction<string>>;
   tokenBudget: { used?: number; total?: number } | null;
   slashCommandsCount: number;
   onToggleCommandMenu: () => void;
+  onInsertSupplementBlock: () => void;
   hasInput: boolean;
   onClearInput: () => void;
   isUserScrolledUp: boolean;
@@ -25,11 +28,14 @@ export default function ChatInputControls({
   permissionMode,
   onModeSwitch,
   provider,
+  codexReasoningEffort,
+  setCodexReasoningEffort,
   thinkingMode,
   setThinkingMode,
   tokenBudget,
   slashCommandsCount,
   onToggleCommandMenu,
+  onInsertSupplementBlock,
   hasInput,
   onClearInput,
   isUserScrolledUp,
@@ -79,7 +85,49 @@ export default function ChatInputControls({
         <ThinkingModeSelector selectedMode={thinkingMode} onModeChange={setThinkingMode} onClose={() => {}} className="" />
       )}
 
+      {provider === 'codex' && (
+        <div className="relative">
+          <select
+            value={codexReasoningEffort}
+            onChange={(event) => {
+              setCodexReasoningEffort(event.target.value);
+            }}
+            className="min-w-[7.25rem] cursor-pointer rounded-lg border border-border/60 bg-muted/50 py-1 pl-3 pr-8 text-sm font-medium text-foreground transition-colors hover:bg-muted focus:outline-none focus:ring-2 focus:ring-primary/20"
+            style={{
+              appearance: 'none',
+              WebkitAppearance: 'none',
+              MozAppearance: 'none',
+              backgroundImage: 'none',
+            }}
+            title="Codex reasoning effort"
+          >
+            {CODEX_REASONING_EFFORTS.OPTIONS.map(({ value, label }) => (
+              <option key={value} value={value}>
+                {label}
+              </option>
+            ))}
+          </select>
+          <svg
+            className="pointer-events-none absolute right-2.5 top-1/2 h-3 w-3 -translate-y-1/2 text-muted-foreground"
+            fill="none"
+            stroke="currentColor"
+            viewBox="0 0 24 24"
+          >
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
+          </svg>
+        </div>
+      )}
+
       <TokenUsagePie used={tokenBudget?.used || 0} total={tokenBudget?.total || parseInt(import.meta.env.VITE_CONTEXT_WINDOW) || 160000} />
+
+      <button
+        type="button"
+        onClick={onInsertSupplementBlock}
+        className="rounded-lg border border-border/60 bg-muted/50 px-2.5 py-1 text-sm font-medium text-muted-foreground transition-all duration-200 hover:bg-muted hover:text-foreground sm:px-3 sm:py-1.5"
+        title={t('input.insertSupplement', { defaultValue: 'Insert supplement block' })}
+      >
+        {t('input.insertSupplementShort', { defaultValue: '插入补充' })}
+      </button>
 
       {!IS_CODEX_ONLY_HARDENED && (
         <button

@@ -14,15 +14,40 @@
  */
 
 import { Codex } from '@openai/codex-sdk';
+import { DatabaseSync } from 'node:sqlite';
+import { spawnSync } from 'child_process';
 import crypto from 'crypto';
-import { promises as fs } from 'fs';
+import fsSync, { promises as fs } from 'fs';
+import os from 'os';
 import path from 'path';
+import { buildLegacyCodexThreadRecord } from './projects.js';
+import {
+  doesCodexSessionLikelyNeedCompaction,
+  extractCodexContextTokenUsageFromTurnUsage,
+  readCodexSessionContextTokenUsage,
+} from './utils/codexTokenUsage.js';
 
 // Track active sessions
 const activeCodexSessions = new Map();
 const CODEX_ONLY_HARDENED_MODE = process.env.CODEX_ONLY_HARDENED_MODE !== 'false';
+const CODEX_SESSION_INDEX_PATH = path.join(os.homedir(), '.codex', 'session_index.jsonl');
+const CODEX_STATE_DB_PATH = path.join(os.homedir(), '.codex', 'state_5.sqlite');
+const CODEX_THREAD_NAME_MAX_LENGTH = 120;
+const CODEX_INTERNAL_ORIGINATOR_ENV = 'CODEX_INTERNAL_ORIGINATOR_OVERRIDE';
+const WINDOWS_DEVICE_PATH_PREFIX = '\\\\?\\';
+const CLI_CODEX_ORIGINATOR = 'codex_cli_rs';
+const SDK_CODEX_ORIGINATOR = 'codex_sdk_ts';
+const SDK_CODEX_SOURCE = 'exec';
+const VSCODE_CODEX_ORIGINATOR = 'codex_vscode';
+const CLI_CODEX_SOURCE = 'cli';
+const VSCODE_CODEX_SOURCE = 'vscode';
+const CODEX_STATE_THREAD_SYNC_RETRY_DELAYS_MS = [1000, 2000, 4000, 8000, 16000];
+const CODEX_AUTO_COMPACT_COMMAND = '/compact';
 
 const NON_ASCII_PATH_PATTERN = /[^\u0000-\u007F]/;
+let cachedPreferredCodexBinaryInfo;
+let hasLoggedCodexBinarySelection = false;
+const pendingCodexStateThreadSyncs = new Map();
 
 function containsNonAscii(value) {
   return typeof value === 'string' && NON_ASCII_PATH_PATTERN.test(value);
@@ -58,6 +83,665 @@ async function ensureAsciiWorkingDirectory(projectPath) {
 
   await fs.symlink(resolvedProjectPath, aliasPath, 'junction');
   return aliasPath;
+}
+
+function summarizeCommandForThreadName(command) {
+  if (typeof command !== 'string') {
+    return 'Codex Session';
+  }
+
+  const normalized = command.replace(/\s+/g, ' ').trim();
+  if (!normalized) {
+    return 'Codex Session';
+  }
+
+  if (normalized.length <= CODEX_THREAD_NAME_MAX_LENGTH) {
+    return normalized;
+  }
+
+  return `${normalized.slice(0, CODEX_THREAD_NAME_MAX_LENGTH - 3).trimEnd()}...`;
+}
+
+function findLocatorCandidates(commandName) {
+  const locatorCommand = process.platform === 'win32' ? 'where.exe' : 'which';
+  const locatorArgs = process.platform === 'win32' ? [commandName] : ['-a', commandName];
+  const result = spawnSync(locatorCommand, locatorArgs, {
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'ignore']
+  });
+
+  if (result.status !== 0 || !result.stdout) {
+    return [];
+  }
+
+  return result.stdout
+    .split(/\r?\n/)
+    .map((value) => value.trim())
+    .filter(Boolean);
+}
+
+function resolveWrappedCodexExecutable(wrapperPath) {
+  try {
+    const wrapperContent = fsSync.readFileSync(wrapperPath, 'utf8');
+    const executableMatch = wrapperContent.match(/"([^"\r\n]+codex\.exe)"/i);
+    return executableMatch?.[1] || null;
+  } catch {
+    return null;
+  }
+}
+
+function resolveCodexExecutableCandidate(candidatePath) {
+  if (!candidatePath || typeof candidatePath !== 'string') {
+    return null;
+  }
+
+  let normalizedCandidate = candidatePath.trim();
+  if (!normalizedCandidate) {
+    return null;
+  }
+
+  if (process.platform === 'win32' && /\.(cmd|bat)$/i.test(normalizedCandidate)) {
+    normalizedCandidate = resolveWrappedCodexExecutable(normalizedCandidate) || '';
+  }
+
+  if (!normalizedCandidate) {
+    return null;
+  }
+
+  try {
+    return fsSync.realpathSync.native(normalizedCandidate);
+  } catch {
+    return fsSync.existsSync(normalizedCandidate) ? normalizedCandidate : null;
+  }
+}
+
+function readCodexCliVersion(binaryPath) {
+  const result = spawnSync(binaryPath, ['--version'], {
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'ignore']
+  });
+
+  if (result.status !== 0 || !result.stdout) {
+    return null;
+  }
+
+  const normalizedOutput = result.stdout.trim();
+  if (!normalizedOutput) {
+    return null;
+  }
+
+  const versionMatch = normalizedOutput.match(/codex-cli\s+([^\s]+)/i);
+  return versionMatch?.[1] || normalizedOutput;
+}
+
+function isVsCodeExtensionCodexBinary(binaryPath) {
+  if (!binaryPath || typeof binaryPath !== 'string') {
+    return false;
+  }
+
+  const normalizedPath = binaryPath.replace(/\//g, '\\').toLowerCase();
+  return normalizedPath.includes('\\.vscode\\extensions\\openai.chatgpt-');
+}
+
+function findVsCodeCodexCandidates() {
+  if (process.platform !== 'win32') {
+    return [];
+  }
+
+  const extensionsRoot = path.join(os.homedir(), '.vscode', 'extensions');
+  try {
+    const entries = fsSync
+      .readdirSync(extensionsRoot, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory() && entry.name.startsWith('openai.chatgpt-'))
+      .map((entry) => {
+        const extensionPath = path.join(extensionsRoot, entry.name);
+        const executablePath = path.join(extensionPath, 'bin', 'windows-x86_64', 'codex.exe');
+        const fallbackArmPath = path.join(extensionPath, 'bin', 'windows-arm64', 'codex.exe');
+        const candidatePath = fsSync.existsSync(executablePath) ? executablePath : fallbackArmPath;
+        let modifiedTimeMs = 0;
+        try {
+          modifiedTimeMs = fsSync.statSync(extensionPath).mtimeMs;
+        } catch {
+          modifiedTimeMs = 0;
+        }
+
+        return {
+          candidatePath,
+          modifiedTimeMs
+        };
+      })
+      .filter((entry) => fsSync.existsSync(entry.candidatePath))
+      .sort((left, right) => right.modifiedTimeMs - left.modifiedTimeMs);
+
+    return entries.map((entry) => entry.candidatePath);
+  } catch {
+    return [];
+  }
+}
+
+function detectSystemCodexBinary() {
+  const envCandidates = [
+    process.env.CODEX_CLI_PATH,
+    process.env.CODEX_PATH
+  ].filter(Boolean);
+  const locatedCandidates = process.platform === 'win32'
+    ? [...findLocatorCandidates('codex.exe'), ...findLocatorCandidates('codex')]
+    : findLocatorCandidates('codex');
+  const allCandidates = [
+    ...envCandidates,
+    ...locatedCandidates,
+    ...findVsCodeCodexCandidates()
+  ];
+  const seenCandidates = new Set();
+
+  for (const candidate of allCandidates) {
+    const executablePath = resolveCodexExecutableCandidate(candidate);
+    if (!executablePath || seenCandidates.has(executablePath)) {
+      continue;
+    }
+
+    seenCandidates.add(executablePath);
+
+    const cliVersion = readCodexCliVersion(executablePath);
+    if (!cliVersion) {
+      continue;
+    }
+
+    return {
+      path: executablePath,
+      cliVersion,
+      useVsCodeSessionMetadata: isVsCodeExtensionCodexBinary(executablePath)
+    };
+  }
+
+  return null;
+}
+
+function getPreferredCodexBinaryInfo() {
+  if (cachedPreferredCodexBinaryInfo !== undefined) {
+    return cachedPreferredCodexBinaryInfo;
+  }
+
+  cachedPreferredCodexBinaryInfo = detectSystemCodexBinary();
+  return cachedPreferredCodexBinaryInfo;
+}
+
+function logCodexBinarySelectionOnce(binaryInfo) {
+  if (hasLoggedCodexBinarySelection) {
+    return;
+  }
+
+  if (binaryInfo?.path) {
+    console.log(
+      '[Codex] Using system Codex CLI binary:',
+      binaryInfo.path,
+      `(version ${binaryInfo.cliVersion || 'unknown'})`
+    );
+  } else {
+    console.log('[Codex] System Codex CLI not found in PATH, falling back to bundled SDK CLI.');
+  }
+
+  hasLoggedCodexBinarySelection = true;
+}
+
+function normalizeCodexSessionIndexField(value) {
+  return typeof value === 'string' && value.trim() ? value.trim() : null;
+}
+
+function normalizeCodexStateThreadCwd(value) {
+  const normalizedCwd = normalizeCodexSessionIndexField(value);
+  if (!normalizedCwd || process.platform !== 'win32') {
+    return normalizedCwd;
+  }
+
+  const resolvedCwd = path.resolve(normalizedCwd);
+  if (resolvedCwd.startsWith(WINDOWS_DEVICE_PATH_PREFIX)) {
+    return resolvedCwd;
+  }
+
+  return `${WINDOWS_DEVICE_PATH_PREFIX}${resolvedCwd}`;
+}
+
+function hasCodexSessionArtifactMetadata(sessionMetadata = {}) {
+  return Boolean(
+    normalizeCodexSessionIndexField(sessionMetadata.cwd) ||
+    normalizeCodexSessionIndexField(sessionMetadata.stateThreadCwd) ||
+    normalizeCodexSessionIndexField(sessionMetadata.originator) ||
+    normalizeCodexSessionIndexField(sessionMetadata.source) ||
+    normalizeCodexSessionIndexField(sessionMetadata.cliVersion)
+  );
+}
+
+function getCodexInteractiveSessionMetadata(preferredCodexBinaryInfo) {
+  if (!preferredCodexBinaryInfo?.path) {
+    return {
+      originator: SDK_CODEX_ORIGINATOR,
+      source: SDK_CODEX_SOURCE
+    };
+  }
+
+  if (preferredCodexBinaryInfo.useVsCodeSessionMetadata) {
+    return {
+      originator: VSCODE_CODEX_ORIGINATOR,
+      source: VSCODE_CODEX_SOURCE
+    };
+  }
+
+  return {
+    originator: CLI_CODEX_ORIGINATOR,
+    source: CLI_CODEX_SOURCE
+  };
+}
+
+function withCodexStateDatabase(callback) {
+  if (!fsSync.existsSync(CODEX_STATE_DB_PATH)) {
+    return null;
+  }
+
+  const database = new DatabaseSync(CODEX_STATE_DB_PATH);
+  try {
+    database.exec('PRAGMA busy_timeout = 2000');
+    return callback(database);
+  } finally {
+    database.close();
+  }
+}
+
+function buildCodexEnvironment(preferredCodexBinaryInfo, isNewSession) {
+  if (!preferredCodexBinaryInfo?.useVsCodeSessionMetadata || !isNewSession) {
+    return undefined;
+  }
+
+  const nextEnvironment = {};
+  for (const [key, value] of Object.entries(process.env)) {
+    if (value !== undefined) {
+      nextEnvironment[key] = value;
+    }
+  }
+
+  nextEnvironment[CODEX_INTERNAL_ORIGINATOR_ENV] = VSCODE_CODEX_ORIGINATOR;
+  return nextEnvironment;
+}
+
+function buildCodexSessionIndexMetadata(preferredCodexBinaryInfo, requestedWorkingDirectory, sessionId) {
+  const isNewSession = !sessionId;
+  const interactiveSessionMetadata = getCodexInteractiveSessionMetadata(preferredCodexBinaryInfo);
+
+  return {
+    cwd: requestedWorkingDirectory,
+    stateThreadCwd: isNewSession ? normalizeCodexStateThreadCwd(requestedWorkingDirectory) : undefined,
+    originator: isNewSession ? interactiveSessionMetadata.originator : undefined,
+    source: isNewSession ? interactiveSessionMetadata.source : undefined,
+    cliVersion: isNewSession ? preferredCodexBinaryInfo?.cliVersion : undefined
+  };
+}
+
+function mergeCodexSessionArtifactMetadata(previousMetadata = {}, nextMetadata = {}) {
+  return {
+    cwd:
+      normalizeCodexSessionIndexField(nextMetadata.cwd) ||
+      normalizeCodexSessionIndexField(previousMetadata.cwd) ||
+      undefined,
+    stateThreadCwd:
+      normalizeCodexSessionIndexField(nextMetadata.stateThreadCwd) ||
+      normalizeCodexSessionIndexField(previousMetadata.stateThreadCwd) ||
+      undefined,
+    originator:
+      normalizeCodexSessionIndexField(nextMetadata.originator) ||
+      normalizeCodexSessionIndexField(previousMetadata.originator) ||
+      undefined,
+    source:
+      normalizeCodexSessionIndexField(nextMetadata.source) ||
+      normalizeCodexSessionIndexField(previousMetadata.source) ||
+      undefined,
+    cliVersion:
+      normalizeCodexSessionIndexField(nextMetadata.cliVersion) ||
+      normalizeCodexSessionIndexField(previousMetadata.cliVersion) ||
+      undefined
+  };
+}
+
+function clearPendingCodexStateThreadSync(sessionId) {
+  const pendingSync = pendingCodexStateThreadSyncs.get(sessionId);
+  if (pendingSync?.timeoutId) {
+    clearTimeout(pendingSync.timeoutId);
+  }
+
+  pendingCodexStateThreadSyncs.delete(sessionId);
+}
+
+function buildCodexNativeTitleMetadata(sessionId) {
+  return withCodexStateDatabase((database) => {
+    const existingThread = database
+      .prepare('SELECT cwd, source, cli_version FROM threads WHERE id = ?')
+      .get(sessionId);
+
+    if (!existingThread) {
+      return null;
+    }
+
+    return {
+      cwd: normalizeCodexSessionIndexField(existingThread.cwd) || undefined,
+      stateThreadCwd: normalizeCodexStateThreadCwd(existingThread.cwd),
+      source: normalizeCodexSessionIndexField(existingThread.source) || undefined,
+      cliVersion: normalizeCodexSessionIndexField(existingThread.cli_version) || undefined
+    };
+  });
+}
+
+async function ensureCodexStateThreadExistsForRename(sessionId, threadName) {
+  const normalizedThreadName =
+    typeof threadName === 'string' && threadName.trim() ? threadName.trim() : 'Codex Session';
+  const existingMetadata = buildCodexNativeTitleMetadata(sessionId);
+  if (existingMetadata) {
+    return existingMetadata;
+  }
+
+  const legacyThreadRecord = await buildLegacyCodexThreadRecord(sessionId);
+  if (!legacyThreadRecord) {
+    throw new Error(`Codex thread metadata not found for session ${sessionId}`);
+  }
+
+  const inserted = withCodexStateDatabase((database) => {
+    const existingThread = database
+      .prepare('SELECT id FROM threads WHERE id = ?')
+      .get(sessionId);
+    if (existingThread) {
+      return true;
+    }
+
+    database.prepare(`
+      INSERT INTO threads (
+        id,
+        rollout_path,
+        created_at,
+        updated_at,
+        source,
+        model_provider,
+        cwd,
+        title,
+        sandbox_policy,
+        approval_mode,
+        cli_version,
+        first_user_message
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      legacyThreadRecord.id,
+      legacyThreadRecord.rolloutPath,
+      legacyThreadRecord.createdAt,
+      legacyThreadRecord.updatedAt,
+      legacyThreadRecord.source,
+      legacyThreadRecord.modelProvider,
+      legacyThreadRecord.cwd,
+      normalizedThreadName,
+      legacyThreadRecord.sandboxPolicy,
+      legacyThreadRecord.approvalMode,
+      legacyThreadRecord.cliVersion,
+      legacyThreadRecord.firstUserMessage
+    );
+
+    return true;
+  });
+
+  if (!inserted) {
+    throw new Error(`Codex state database unavailable for session ${sessionId}`);
+  }
+
+  const nextMetadata = buildCodexNativeTitleMetadata(sessionId);
+  if (!nextMetadata) {
+    throw new Error(`Codex thread metadata sync failed for session ${sessionId}`);
+  }
+
+  return nextMetadata;
+}
+
+async function syncCodexSessionIndex(sessionId, threadName, preserveExistingTitle = false, sessionMetadata = {}) {
+  if (!sessionId || typeof sessionId !== 'string') {
+    return;
+  }
+
+  const normalizedThreadName =
+    typeof threadName === 'string' && threadName.trim() ? threadName.trim() : 'Codex Session';
+  const updatedAt = new Date().toISOString();
+  const preservedRawLines = [];
+  const entriesById = new Map();
+
+  try {
+    const existing = await fs.readFile(CODEX_SESSION_INDEX_PATH, 'utf8');
+    for (const line of existing.split(/\r?\n/)) {
+      if (!line.trim()) {
+        continue;
+      }
+
+      try {
+        const parsed = JSON.parse(line);
+        if (parsed && typeof parsed.id === 'string' && parsed.id.trim()) {
+          entriesById.set(parsed.id, parsed);
+        } else {
+          preservedRawLines.push(line);
+        }
+      } catch {
+        preservedRawLines.push(line);
+      }
+    }
+  } catch (error) {
+    if (error.code !== 'ENOENT') {
+      throw error;
+    }
+  }
+
+  const existingEntry = entriesById.get(sessionId);
+  const nextThreadName =
+    preserveExistingTitle && existingEntry?.thread_name
+      ? existingEntry.thread_name
+      : normalizedThreadName;
+  const normalizedSessionCwd = normalizeCodexSessionIndexField(sessionMetadata.cwd);
+  const normalizedOriginator = normalizeCodexSessionIndexField(sessionMetadata.originator);
+  const normalizedSource = normalizeCodexSessionIndexField(sessionMetadata.source);
+  const normalizedCliVersion = normalizeCodexSessionIndexField(sessionMetadata.cliVersion);
+
+  entriesById.set(sessionId, {
+    ...existingEntry,
+    id: sessionId,
+    thread_name: nextThreadName,
+    updated_at: updatedAt,
+    cwd: normalizedSessionCwd || existingEntry?.cwd || undefined,
+    originator: normalizedOriginator || existingEntry?.originator || undefined,
+    source: normalizedSource || existingEntry?.source || undefined,
+    cli_version: normalizedCliVersion || existingEntry?.cli_version || undefined
+  });
+
+  const nextContent = [
+    ...preservedRawLines,
+    ...Array.from(entriesById.values()).map((entry) => JSON.stringify(entry))
+  ].join('\n');
+
+  await fs.mkdir(path.dirname(CODEX_SESSION_INDEX_PATH), { recursive: true });
+
+  const tempPath = `${CODEX_SESSION_INDEX_PATH}.${process.pid}.tmp`;
+  await fs.writeFile(tempPath, `${nextContent}\n`, 'utf8');
+  await fs.rename(tempPath, CODEX_SESSION_INDEX_PATH);
+}
+
+function syncCodexStateThread(sessionId, threadName, preserveExistingTitle = false, sessionMetadata = {}) {
+  if (!sessionId || typeof sessionId !== 'string' || !hasCodexSessionArtifactMetadata(sessionMetadata)) {
+    return false;
+  }
+
+  const normalizedThreadName =
+    typeof threadName === 'string' && threadName.trim() ? threadName.trim() : 'Codex Session';
+  const normalizedThreadCwd =
+    normalizeCodexSessionIndexField(sessionMetadata.stateThreadCwd) ||
+    normalizeCodexStateThreadCwd(sessionMetadata.cwd);
+  const normalizedSource = normalizeCodexSessionIndexField(sessionMetadata.source);
+  const normalizedCliVersion = normalizeCodexSessionIndexField(sessionMetadata.cliVersion);
+
+  try {
+    return Boolean(withCodexStateDatabase((database) => {
+      const existingThread = database
+        .prepare('SELECT title, rollout_path, cwd, source, cli_version FROM threads WHERE id = ?')
+        .get(sessionId);
+
+      if (!existingThread) {
+        return false;
+      }
+
+      const nextTitle =
+        preserveExistingTitle && normalizeCodexSessionIndexField(existingThread.title)
+          ? existingThread.title
+          : normalizedThreadName;
+      const nextThreadCwd = normalizedThreadCwd || existingThread.cwd || null;
+      const nextSource = normalizedSource || existingThread.source || null;
+      const nextCliVersion = normalizedCliVersion || existingThread.cli_version || null;
+
+      database
+        .prepare(
+          'UPDATE threads SET title = ?, cwd = ?, source = ?, cli_version = ? WHERE id = ?'
+        )
+        .run(nextTitle, nextThreadCwd, nextSource, nextCliVersion, sessionId);
+
+      return true;
+    }));
+  } catch (error) {
+    console.warn('[Codex] Failed to sync state_5.sqlite thread metadata:', error);
+    return false;
+  }
+}
+
+/**
+ * Retry `state_5.sqlite.threads` metadata sync because the Codex CLI may
+ * create the row several seconds after `thread.started`.
+ */
+function scheduleCodexStateThreadSyncRetry(
+  sessionId,
+  threadName,
+  preserveExistingTitle = false,
+  sessionMetadata = {}
+) {
+  if (!sessionId || typeof sessionId !== 'string' || !hasCodexSessionArtifactMetadata(sessionMetadata)) {
+    return;
+  }
+
+  const pendingSync = pendingCodexStateThreadSyncs.get(sessionId) || {
+    attemptIndex: 0,
+    timeoutId: null,
+    threadName,
+    preserveExistingTitle,
+    sessionMetadata: {}
+  };
+
+  pendingSync.threadName = threadName;
+  pendingSync.preserveExistingTitle = pendingSync.preserveExistingTitle || preserveExistingTitle;
+  pendingSync.sessionMetadata = mergeCodexSessionArtifactMetadata(
+    pendingSync.sessionMetadata,
+    sessionMetadata
+  );
+  pendingCodexStateThreadSyncs.set(sessionId, pendingSync);
+
+  if (pendingSync.timeoutId) {
+    return;
+  }
+
+  const retryDelayMs = CODEX_STATE_THREAD_SYNC_RETRY_DELAYS_MS[pendingSync.attemptIndex];
+  if (retryDelayMs === undefined) {
+    console.warn(
+      `[Codex] state_5.sqlite thread row still unavailable after retries for session ${sessionId}`
+    );
+    clearPendingCodexStateThreadSync(sessionId);
+    return;
+  }
+
+  pendingSync.timeoutId = setTimeout(() => {
+    pendingSync.timeoutId = null;
+
+    const synced = syncCodexStateThread(
+      sessionId,
+      pendingSync.threadName,
+      pendingSync.preserveExistingTitle,
+      pendingSync.sessionMetadata
+    );
+    if (synced) {
+      clearPendingCodexStateThreadSync(sessionId);
+      return;
+    }
+
+    pendingSync.attemptIndex += 1;
+    scheduleCodexStateThreadSyncRetry(
+      sessionId,
+      pendingSync.threadName,
+      pendingSync.preserveExistingTitle,
+      pendingSync.sessionMetadata
+    );
+  }, retryDelayMs);
+  pendingSync.timeoutId.unref?.();
+}
+
+async function syncCodexSessionArtifacts(
+  sessionId,
+  threadName,
+  preserveExistingTitle = false,
+  sessionMetadata = {}
+) {
+  await syncCodexSessionIndex(sessionId, threadName, preserveExistingTitle, sessionMetadata);
+  // Trust the Codex CLI to own rollout file contents. We only sync secondary indexes here.
+  const synced = syncCodexStateThread(sessionId, threadName, preserveExistingTitle, sessionMetadata);
+  if (synced) {
+    clearPendingCodexStateThreadSync(sessionId);
+    return;
+  }
+
+  scheduleCodexStateThreadSyncRetry(sessionId, threadName, preserveExistingTitle, sessionMetadata);
+}
+
+/**
+ * Rename a Codex session using the native CLI metadata store.
+ * Updates `state_5.sqlite.threads.title` as the source of truth and
+ * keeps `session_index.jsonl.thread_name` in sync for compatibility.
+ *
+ * @param {string} sessionId Codex session id; must be a valid existing session.
+ * @param {string} threadName User-provided title; trimmed and required.
+ * @returns {Promise<void>} Resolves when native metadata has been updated.
+ * @throws {Error} When the session metadata cannot be located or the native stores cannot be updated.
+ */
+export async function renameCodexSessionTitle(sessionId, threadName) {
+  if (!sessionId || typeof sessionId !== 'string') {
+    throw new Error('Codex sessionId is required');
+  }
+
+  const normalizedThreadName =
+    typeof threadName === 'string' && threadName.trim() ? threadName.trim() : '';
+  if (!normalizedThreadName) {
+    throw new Error('Codex thread title is required');
+  }
+
+  const sessionMetadata = await ensureCodexStateThreadExistsForRename(sessionId, normalizedThreadName);
+  const syncedStateThread = syncCodexStateThread(
+    sessionId,
+    normalizedThreadName,
+    false,
+    sessionMetadata
+  );
+  if (!syncedStateThread) {
+    throw new Error(`Failed to update Codex native title for session ${sessionId}`);
+  }
+
+  await syncCodexSessionIndex(sessionId, normalizedThreadName, false, sessionMetadata);
+  clearPendingCodexStateThreadSync(sessionId);
+}
+
+function rekeyActiveCodexSession(previousSessionId, nextSessionId) {
+  if (!previousSessionId || !nextSessionId || previousSessionId === nextSessionId) {
+    return nextSessionId;
+  }
+
+  const session = activeCodexSessions.get(previousSessionId);
+  if (!session) {
+    return nextSessionId;
+  }
+
+  activeCodexSessions.set(nextSessionId, session);
+  activeCodexSessions.delete(previousSessionId);
+  return nextSessionId;
 }
 
 /**
@@ -181,7 +865,7 @@ function transformCodexEvent(event) {
     case 'thread.started':
       return {
         type: 'thread_started',
-        threadId: event.id
+        threadId: event.thread_id
       };
 
     case 'error':
@@ -241,6 +925,273 @@ function buildPlanModePrompt(command) {
   ].join('\n');
 }
 
+function normalizeCodexAttachmentEntry(entry) {
+  if (!entry || typeof entry !== 'object' || typeof entry.path !== 'string' || !entry.path.trim()) {
+    return null;
+  }
+
+  const normalizedPath = path.resolve(entry.path.trim());
+  const mimeType = typeof entry.mimeType === 'string' ? entry.mimeType : '';
+  const kind =
+    entry.kind === 'image' || mimeType.startsWith('image/')
+      ? 'image'
+      : 'file';
+
+  return {
+    path: normalizedPath,
+    kind
+  };
+}
+
+function collectCodexAdditionalDirectories(workingDirectory, attachments = []) {
+  const directories = new Set();
+
+  attachments.forEach((attachment) => {
+    if (attachment?.path) {
+      directories.add(path.dirname(attachment.path));
+    }
+  });
+
+  return Array.from(directories).filter((directory) => path.resolve(directory) !== path.resolve(workingDirectory));
+}
+
+function buildCodexInput(command, attachments = []) {
+  const imageAttachments = attachments.filter((attachment) => attachment.kind === 'image');
+  if (imageAttachments.length === 0) {
+    return command;
+  }
+
+  const inputItems = [];
+  if (typeof command === 'string' && command.trim()) {
+    inputItems.push({
+      type: 'text',
+      text: command
+    });
+  } else {
+    inputItems.push({
+      type: 'text',
+      text: 'Use the attached image(s) as additional context.'
+    });
+  }
+
+  imageAttachments.forEach((attachment) => {
+    inputItems.push({
+      type: 'local_image',
+      path: attachment.path
+    });
+  });
+
+  return inputItems;
+}
+
+function extractCodexErrorMessage(errorLike) {
+  if (!errorLike) {
+    return '';
+  }
+
+  if (typeof errorLike === 'string') {
+    return errorLike;
+  }
+
+  if (typeof errorLike.message === 'string') {
+    return errorLike.message;
+  }
+
+  if (typeof errorLike.error === 'string') {
+    return errorLike.error;
+  }
+
+  if (typeof errorLike.error?.message === 'string') {
+    return errorLike.error.message;
+  }
+
+  try {
+    return JSON.stringify(errorLike);
+  } catch {
+    return String(errorLike);
+  }
+}
+
+function isCodexCompactCommand(command) {
+  return typeof command === 'string' && command.trim().toLowerCase().startsWith(CODEX_AUTO_COMPACT_COMMAND);
+}
+
+function isCodexContextLimitError(errorLike) {
+  const message = extractCodexErrorMessage(errorLike).toLowerCase();
+  if (!message) {
+    return false;
+  }
+
+  return [
+    'context window',
+    'context limit',
+    'maximum context length',
+    'max context length',
+    'too many tokens',
+    'prompt is too long',
+    'input is too long',
+    'reduce the length',
+    'context_length_exceeded',
+    'input_tokens',
+  ].some((pattern) => message.includes(pattern));
+}
+
+async function executeCodexAttempt({
+  codex,
+  resumeSessionId,
+  effectiveInput,
+  threadOptions,
+  ws,
+  abortController,
+  fallbackThreadName,
+  preferredCodexBinaryInfo,
+  requestedWorkingDirectory,
+}) {
+  const sessionIndexMetadata = buildCodexSessionIndexMetadata(
+    preferredCodexBinaryInfo,
+    requestedWorkingDirectory,
+    resumeSessionId
+  );
+  let thread;
+  let currentSessionId = resumeSessionId || `codex-web-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  let hasSentSessionCreated = false;
+
+  try {
+    thread = resumeSessionId
+      ? codex.resumeThread(resumeSessionId, threadOptions)
+      : codex.startThread(threadOptions);
+
+    activeCodexSessions.set(currentSessionId, {
+      thread,
+      codex,
+      status: 'running',
+      abortController,
+      startedAt: new Date().toISOString()
+    });
+
+    if (resumeSessionId) {
+      await syncCodexSessionArtifacts(
+        resumeSessionId,
+        fallbackThreadName,
+        true,
+        sessionIndexMetadata
+      );
+      sendMessage(ws, {
+        type: 'session-created',
+        sessionId: resumeSessionId,
+        provider: 'codex'
+      });
+      hasSentSessionCreated = true;
+    }
+
+    const streamedTurn = await thread.runStreamed(effectiveInput, {
+      signal: abortController.signal
+    });
+
+    for await (const event of streamedTurn.events) {
+      if (event.type === 'thread.started' && event.thread_id) {
+        currentSessionId = rekeyActiveCodexSession(currentSessionId, event.thread_id);
+        await syncCodexSessionArtifacts(
+          currentSessionId,
+          fallbackThreadName,
+          Boolean(resumeSessionId),
+          sessionIndexMetadata
+        );
+
+        if (!hasSentSessionCreated) {
+          sendMessage(ws, {
+            type: 'session-created',
+            sessionId: currentSessionId,
+            provider: 'codex'
+          });
+          hasSentSessionCreated = true;
+        }
+      }
+
+      const activeSession = activeCodexSessions.get(currentSessionId);
+      if (!activeSession || activeSession.status === 'aborted') {
+        break;
+      }
+
+      if (event.type === 'item.started' || event.type === 'item.updated') {
+        continue;
+      }
+
+      const transformed = transformCodexEvent(event);
+      sendMessage(ws, {
+        type: 'codex-response',
+        data: transformed,
+        sessionId: currentSessionId
+      });
+
+      if (event.type === 'turn.completed' && event.usage) {
+        await syncCodexSessionArtifacts(
+          currentSessionId,
+          fallbackThreadName,
+          Boolean(resumeSessionId),
+          sessionIndexMetadata
+        );
+        const tokenUsage = extractCodexContextTokenUsageFromTurnUsage(event.usage);
+        sendMessage(ws, {
+          type: 'token-budget',
+          data: tokenUsage || {
+            used: 0,
+            total: 200000
+          },
+          sessionId: currentSessionId
+        });
+      }
+    }
+
+    const finalSessionId = thread.id || currentSessionId;
+    currentSessionId = rekeyActiveCodexSession(currentSessionId, finalSessionId);
+    await syncCodexSessionArtifacts(
+      currentSessionId,
+      fallbackThreadName,
+      Boolean(resumeSessionId),
+      sessionIndexMetadata
+    );
+
+    if (!hasSentSessionCreated && currentSessionId) {
+      sendMessage(ws, {
+        type: 'session-created',
+        sessionId: currentSessionId,
+        provider: 'codex'
+      });
+    }
+
+    return {
+      sessionId: currentSessionId,
+      wasAborted: false,
+    };
+  } catch (error) {
+    const activeSession = currentSessionId ? activeCodexSessions.get(currentSessionId) : null;
+    const wasAborted =
+      activeSession?.status === 'aborted' ||
+      error?.name === 'AbortError' ||
+      String(error?.message || '').toLowerCase().includes('aborted');
+
+    if (wasAborted) {
+      return {
+        sessionId: currentSessionId,
+        wasAborted: true,
+      };
+    }
+
+    if (error && typeof error === 'object') {
+      error.codexSessionId = currentSessionId;
+    }
+    throw error;
+  } finally {
+    if (currentSessionId) {
+      const activeSession = activeCodexSessions.get(currentSessionId);
+      if (activeSession) {
+        activeSession.status = activeSession.status === 'aborted' ? 'aborted' : 'completed';
+      }
+    }
+  }
+}
+
 /**
  * Execute a Codex query with streaming
  * @param {string} command - The prompt to send
@@ -254,7 +1205,8 @@ export async function queryCodex(command, options = {}, ws) {
     projectPath,
     model,
     modelReasoningEffort,
-    permissionMode = 'default'
+    permissionMode = 'default',
+    attachments = []
   } = options;
 
   const requestedWorkingDirectory = cwd || projectPath || process.cwd();
@@ -263,16 +1215,30 @@ export async function queryCodex(command, options = {}, ws) {
     console.log('[Codex] Using ASCII working directory alias:', workingDirectory, 'for', requestedWorkingDirectory);
   }
   const { sandboxMode, approvalPolicy } = mapPermissionModeToCodexOptions(permissionMode);
-  const effectiveCommand = permissionMode === 'plan' ? buildPlanModePrompt(command) : command;
+  const normalizedAttachments = Array.isArray(attachments)
+    ? attachments.map(normalizeCodexAttachmentEntry).filter(Boolean)
+    : [];
+  const additionalDirectories = collectCodexAdditionalDirectories(requestedWorkingDirectory, normalizedAttachments);
+  const baseCommand = permissionMode === 'plan' ? buildPlanModePrompt(command) : command;
+  const fallbackThreadName = summarizeCommandForThreadName(command);
+  const preferredCodexBinaryInfo = getPreferredCodexBinaryInfo();
+  const preferredCodexPath = preferredCodexBinaryInfo?.path || null;
+  const codexEnvironment = buildCodexEnvironment(
+    preferredCodexBinaryInfo,
+    !sessionId
+  );
 
   let codex;
-  let thread;
-  let currentSessionId = sessionId;
+  let currentSessionId = sessionId || `codex-web-${Date.now()}`;
   const abortController = new AbortController();
+  let hasAttemptedAutomaticCompaction = false;
 
   try {
     // Initialize Codex SDK
-    codex = new Codex();
+    logCodexBinarySelectionOnce(preferredCodexBinaryInfo);
+    codex = preferredCodexPath
+      ? new Codex({ codexPathOverride: preferredCodexPath, env: codexEnvironment })
+      : new Codex();
 
     // Thread options with sandbox and approval settings
     const threadOptions = {
@@ -281,78 +1247,60 @@ export async function queryCodex(command, options = {}, ws) {
       sandboxMode,
       approvalPolicy,
       model,
-      modelReasoningEffort
+      modelReasoningEffort,
+      additionalDirectories: additionalDirectories.length > 0 ? additionalDirectories : undefined
     };
+    const effectiveInput = buildCodexInput(baseCommand, normalizedAttachments);
 
-    // Start or resume thread
-    if (sessionId) {
-      thread = codex.resumeThread(sessionId, threadOptions);
-    } else {
-      thread = codex.startThread(threadOptions);
+    if (sessionId && !isCodexCompactCommand(command)) {
+      try {
+        const currentTokenUsage = await readCodexSessionContextTokenUsage(sessionId);
+        if (doesCodexSessionLikelyNeedCompaction(currentTokenUsage)) {
+          hasAttemptedAutomaticCompaction = true;
+          const compactAttempt = await executeCodexAttempt({
+            codex,
+            resumeSessionId: sessionId,
+            effectiveInput: CODEX_AUTO_COMPACT_COMMAND,
+            threadOptions,
+            ws,
+            abortController,
+            fallbackThreadName,
+            preferredCodexBinaryInfo,
+            requestedWorkingDirectory,
+          });
+          currentSessionId = compactAttempt.sessionId || currentSessionId;
+
+          if (compactAttempt.wasAborted) {
+            return;
+          }
+        }
+      } catch (compactPreparationError) {
+        console.warn('[Codex] Automatic preflight compaction skipped:', compactPreparationError);
+      }
     }
 
-    // Get the thread ID
-    currentSessionId = thread.id || sessionId || `codex-${Date.now()}`;
-
-    // Track the session
-    activeCodexSessions.set(currentSessionId, {
-      thread,
+    const attemptResult = await executeCodexAttempt({
       codex,
-      status: 'running',
+      resumeSessionId: currentSessionId || sessionId,
+      effectiveInput,
+      threadOptions,
+      ws,
       abortController,
-      startedAt: new Date().toISOString()
+      fallbackThreadName,
+      preferredCodexBinaryInfo,
+      requestedWorkingDirectory,
     });
+    currentSessionId = attemptResult.sessionId || currentSessionId;
 
-    // Send session created event
-    sendMessage(ws, {
-      type: 'session-created',
-      sessionId: currentSessionId,
-      provider: 'codex'
-    });
-
-    // Execute with streaming
-    const streamedTurn = await thread.runStreamed(effectiveCommand, {
-      signal: abortController.signal
-    });
-
-    for await (const event of streamedTurn.events) {
-      // Check if session was aborted
-      const session = activeCodexSessions.get(currentSessionId);
-      if (!session || session.status === 'aborted') {
-        break;
-      }
-
-      if (event.type === 'item.started' || event.type === 'item.updated') {
-        continue;
-      }
-
-      const transformed = transformCodexEvent(event);
-
-      sendMessage(ws, {
-        type: 'codex-response',
-        data: transformed,
-        sessionId: currentSessionId
-      });
-
-      // Extract and send token usage if available (normalized to match Claude format)
-      if (event.type === 'turn.completed' && event.usage) {
-        const totalTokens = (event.usage.input_tokens || 0) + (event.usage.output_tokens || 0);
-        sendMessage(ws, {
-          type: 'token-budget',
-          data: {
-            used: totalTokens,
-            total: 200000 // Default context window for Codex models
-          },
-          sessionId: currentSessionId
-        });
-      }
+    if (attemptResult.wasAborted) {
+      return;
     }
 
     // Send completion event
     sendMessage(ws, {
       type: 'codex-complete',
       sessionId: currentSessionId,
-      actualSessionId: thread.id
+      actualSessionId: currentSessionId
     });
 
   } catch (error) {
@@ -362,22 +1310,84 @@ export async function queryCodex(command, options = {}, ws) {
       error?.name === 'AbortError' ||
       String(error?.message || '').toLowerCase().includes('aborted');
 
+    if (
+      !wasAborted &&
+      currentSessionId &&
+      !hasAttemptedAutomaticCompaction &&
+      !isCodexCompactCommand(command) &&
+      isCodexContextLimitError(error)
+    ) {
+      try {
+        hasAttemptedAutomaticCompaction = true;
+
+        const compactAttempt = await executeCodexAttempt({
+          codex,
+          resumeSessionId: currentSessionId,
+          effectiveInput: CODEX_AUTO_COMPACT_COMMAND,
+          threadOptions: {
+            workingDirectory,
+            skipGitRepoCheck: true,
+            sandboxMode,
+            approvalPolicy,
+            model,
+            modelReasoningEffort,
+            additionalDirectories: additionalDirectories.length > 0 ? additionalDirectories : undefined
+          },
+          ws,
+          abortController,
+          fallbackThreadName,
+          preferredCodexBinaryInfo,
+          requestedWorkingDirectory,
+        });
+        currentSessionId = compactAttempt.sessionId || currentSessionId;
+
+        if (compactAttempt.wasAborted) {
+          return;
+        }
+
+        const retryAttempt = await executeCodexAttempt({
+          codex,
+          resumeSessionId: currentSessionId,
+          effectiveInput,
+          threadOptions: {
+            workingDirectory,
+            skipGitRepoCheck: true,
+            sandboxMode,
+            approvalPolicy,
+            model,
+            modelReasoningEffort,
+            additionalDirectories: additionalDirectories.length > 0 ? additionalDirectories : undefined
+          },
+          ws,
+          abortController,
+          fallbackThreadName,
+          preferredCodexBinaryInfo,
+          requestedWorkingDirectory,
+        });
+        currentSessionId = retryAttempt.sessionId || currentSessionId;
+
+        if (retryAttempt.wasAborted) {
+          return;
+        }
+
+        sendMessage(ws, {
+          type: 'codex-complete',
+          sessionId: currentSessionId,
+          actualSessionId: currentSessionId
+        });
+        return;
+      } catch (compactionError) {
+        error = compactionError;
+      }
+    }
+
     if (!wasAborted) {
       console.error('[Codex] Error:', error);
       sendMessage(ws, {
         type: 'codex-error',
-        error: error.message,
-        sessionId: currentSessionId
+        error: extractCodexErrorMessage(error),
+        sessionId: error?.codexSessionId || currentSessionId
       });
-    }
-
-  } finally {
-    // Update session status
-    if (currentSessionId) {
-      const session = activeCodexSessions.get(currentSessionId);
-      if (session) {
-        session.status = session.status === 'aborted' ? 'aborted' : 'completed';
-      }
     }
   }
 }

@@ -23,6 +23,21 @@
 
 如果觉得还有点用，请帮忙star一下，谢谢啦~
 
+## 文档导航
+
+如果你是维护者、协作者，或准备让 Agent 接手这个项目，建议先看这几份文档：
+
+- 项目索引：[`index.md`](index.md)
+- 项目记忆：[`memory.md`](memory.md)
+- 项目提示词：[`agent.md`](agent.md)
+- 需求文档：[`docs/requirements.md`](docs/requirements.md)
+- API 文档：[`docs/api.md`](docs/api.md)
+- 技术文档：[`docs/technical.md`](docs/technical.md)
+- 待办任务：[`todo.md`](todo.md)
+- 已完成任务：[`done.md`](done.md)
+
+中文显示说明：在 Windows PowerShell 里直接查看 UTF-8 中文文档时，若出现乱码，先执行 `[Console]::OutputEncoding = [System.Text.Encoding]::UTF8`，再用 `Get-Content -Encoding UTF8 <文件>` 读取；这类情况通常是控制台显示问题，不是文件内容损坏。
+
 ## 界面预览
 
 下面这张图是 Windows 桌面控制工具的公开 README 预览图：
@@ -320,9 +335,15 @@ powershell -ExecutionPolicy Bypass -File scripts/smoke-test-override-flow.ps1 -U
 
 ## 推荐阅读
 
+- 项目索引：[`index.md`](index.md)
+- 项目记忆：[`memory.md`](memory.md)
+- 项目提示词：[`agent.md`](agent.md)
 - 部署说明：[`docs/DEPLOYMENT.zh-CN.md`](docs/DEPLOYMENT.zh-CN.md)
 - 登录自启：[`docs/AUTOSTART.zh-CN.md`](docs/AUTOSTART.zh-CN.md)
 - 架构说明：[`docs/ARCHITECTURE.zh-CN.md`](docs/ARCHITECTURE.zh-CN.md)
+- 需求文档：[`docs/requirements.md`](docs/requirements.md)
+- API 文档：[`docs/api.md`](docs/api.md)
+- 技术文档：[`docs/technical.md`](docs/technical.md)
 - 安全策略：[`SECURITY.zh-CN.md`](SECURITY.zh-CN.md)
 - 开源发布检查清单：[`docs/OPEN_SOURCE_RELEASE_CHECKLIST.zh-CN.md`](docs/OPEN_SOURCE_RELEASE_CHECKLIST.zh-CN.md)
 

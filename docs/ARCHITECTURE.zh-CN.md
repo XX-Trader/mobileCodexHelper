@@ -143,13 +143,15 @@ Tailscale 私网 HTTPS
 
 - 数据库存到 `session_notifications`
 - 会话完成时由后端写入未读
-- 任一设备点开后，通过 `/api/session-notifications/read` 清除
+- Codex CLI 的打开、继续、resume 都不算消费，CLI 只负责产出“已完成”事件
+- 只有 Web 端前台真正打开并完成展示后，才通过 `/api/session-notifications/read` 清除
+- 读取未读列表时，服务端会按当前仍可发现的会话集合过滤并清理历史孤儿 `session_id`
 - 清除后通过 WebSocket 广播 `session-notifications-state`，让所有已登录设备同步更新
 
 这样做的好处是：
 
 - 红色未读不再依赖 `localStorage`
-- 多设备同时在线时不会各自维护一套不同的已读状态
+- Web 端之间共享同一份已读结果，但后台标签页和 CLI 不会误消费
 - 绿色继续保持轻量，不需要引入额外的设备在线心跳机制
 
 ## 为什么项目隐藏放在服务端配置

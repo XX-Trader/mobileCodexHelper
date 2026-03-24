@@ -1,4 +1,4 @@
-import { Check, ChevronDown, ChevronRight, Edit3, Folder, FolderOpen, Star, Trash2, X } from 'lucide-react';
+import { Check, ChevronDown, ChevronRight, Edit3, EyeOff, Folder, FolderOpen, Star, Trash2, X } from 'lucide-react';
 import type { TFunction } from 'i18next';
 import { Button } from '../../../../shared/view/ui';
 import { cn } from '../../../../lib/utils';
@@ -120,6 +120,7 @@ export default function SidebarProjectItem({
   onCancelEditingProject,
   onSaveProjectName,
   onDeleteProject,
+  onHideProject,
   onSessionSelect,
   onDeleteSession,
   onLoadMoreSessions,
@@ -144,6 +145,9 @@ export default function SidebarProjectItem({
 
   const saveProjectName = () => {
     onSaveProjectName(project.name);
+  };
+  const hideProject = () => {
+    onHideProject?.(project);
   };
 
   const selectAndToggleProject = () => {
@@ -288,6 +292,18 @@ export default function SidebarProjectItem({
                       />
                     </button>
 
+                    {onHideProject && (
+                      <button
+                        className="flex h-8 w-8 items-center justify-center rounded-lg border border-orange-200 bg-orange-500/10 active:scale-90 dark:border-orange-800 dark:bg-orange-900/30"
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          hideProject();
+                        }}
+                        title={t('tooltips.hideProject')}
+                      >
+                        <EyeOff className="h-4 w-4 text-orange-600 dark:text-orange-400" />
+                      </button>
+                    )}
                     {!IS_CODEX_ONLY_HARDENED && (
                       <>
                         <button
@@ -433,6 +449,18 @@ export default function SidebarProjectItem({
               </>
             ) : (
               <>
+                {onHideProject && (
+                  <div
+                    className="touch:opacity-100 flex h-6 w-6 cursor-pointer items-center justify-center rounded opacity-0 transition-all duration-200 hover:bg-orange-50 group-hover:opacity-100 dark:hover:bg-orange-900/20"
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      hideProject();
+                    }}
+                    title={t('tooltips.hideProject')}
+                  >
+                    <EyeOff className="h-3 w-3 text-orange-600 dark:text-orange-400" />
+                  </div>
+                )}
                 <div
                   className={cn(
                     'w-6 h-6 opacity-0 group-hover:opacity-100 transition-all duration-200 flex items-center justify-center rounded cursor-pointer touch:opacity-100',

@@ -1,5 +1,4 @@
 import { useTranslation } from 'react-i18next';
-import { IS_CODEX_ONLY_HARDENED } from '../../../../constants/config';
 import type {
   ChangeEvent,
   ClipboardEvent,
@@ -43,6 +42,8 @@ interface ChatComposerProps {
   ) => void;
   handleGrantToolPermission: (suggestion: { entry: string; toolName: string }) => { success: boolean };
   claudeStatus: { text: string; tokens: number; can_interrupt: boolean } | null;
+  statusStartedAt?: number | null;
+  queuedCodexFollowUpCount: number;
   isLoading: boolean;
   onAbortSession: () => void;
   provider: Provider | string;
@@ -55,18 +56,22 @@ interface ChatComposerProps {
   tokenBudget: { used?: number; total?: number } | null;
   slashCommandsCount: number;
   onToggleCommandMenu: () => void;
-  onInsertSupplementBlock: () => void;
   hasInput: boolean;
   onClearInput: () => void;
   isUserScrolledUp: boolean;
   hasMessages: boolean;
   onScrollToBottom: () => void;
+  onScrollToPreviousUserMessage: () => void;
+  onScrollToNextUserMessage: () => void;
   onSubmit: (event: FormEvent<HTMLFormElement> | MouseEvent<HTMLButtonElement> | TouchEvent<HTMLButtonElement>) => void;
   isDragActive: boolean;
   attachedImages: File[];
   onRemoveImage: (index: number) => void;
+  attachedFiles: File[];
+  onRemoveFile: (index: number) => void;
   uploadingImages: Map<string, number>;
   imageErrors: Map<string, string>;
+  fileErrors: Map<string, string>;
   showFileDropdown: boolean;
   filteredFiles: MentionableFile[];
   selectedFileIndex: number;
@@ -79,7 +84,7 @@ interface ChatComposerProps {
   frequentCommands: SlashCommand[];
   getRootProps: (...args: unknown[]) => Record<string, unknown>;
   getInputProps: (...args: unknown[]) => Record<string, unknown>;
-  openImagePicker: () => void;
+  openAttachmentPicker: () => void;
   inputHighlightRef: RefObject<HTMLDivElement>;
   renderInputWithMentions: (text: string) => ReactNode;
   textareaRef: RefObject<HTMLTextAreaElement>;
@@ -110,6 +115,8 @@ export default function ChatComposer({
   handlePermissionDecision,
   handleGrantToolPermission,
   claudeStatus,
+  statusStartedAt = null,
+  queuedCodexFollowUpCount,
   isLoading,
   onAbortSession,
   provider,
@@ -122,18 +129,22 @@ export default function ChatComposer({
   tokenBudget,
   slashCommandsCount,
   onToggleCommandMenu,
-  onInsertSupplementBlock,
   hasInput,
   onClearInput,
   isUserScrolledUp,
   hasMessages,
   onScrollToBottom,
+  onScrollToPreviousUserMessage,
+  onScrollToNextUserMessage,
   onSubmit,
   isDragActive,
   attachedImages,
   onRemoveImage,
+  attachedFiles,
+  onRemoveFile,
   uploadingImages,
   imageErrors,
+  fileErrors,
   showFileDropdown,
   filteredFiles,
   selectedFileIndex,
@@ -146,7 +157,7 @@ export default function ChatComposer({
   frequentCommands,
   getRootProps,
   getInputProps,
-  openImagePicker,
+  openAttachmentPicker,
   inputHighlightRef,
   renderInputWithMentions,
   textareaRef,
@@ -189,6 +200,8 @@ export default function ChatComposer({
         <div className="mx-auto mb-2 max-w-4xl sm:mb-3">
           <ClaudeStatus
             status={claudeStatus}
+            startedAt={statusStartedAt}
+            queuedCount={queuedCodexFollowUpCount}
             isLoading={isLoading}
             onAbort={onAbortSession}
             provider={provider}
@@ -214,12 +227,13 @@ export default function ChatComposer({
           tokenBudget={tokenBudget}
           slashCommandsCount={slashCommandsCount}
           onToggleCommandMenu={onToggleCommandMenu}
-          onInsertSupplementBlock={onInsertSupplementBlock}
           hasInput={hasInput}
           onClearInput={onClearInput}
           isUserScrolledUp={isUserScrolledUp}
           hasMessages={hasMessages}
           onScrollToBottom={onScrollToBottom}
+          onScrollToPreviousUserMessage={onScrollToPreviousUserMessage}
+          onScrollToNextUserMessage={onScrollToNextUserMessage}
         />}
       </div>
 
@@ -235,12 +249,14 @@ export default function ChatComposer({
                   d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12"
                 />
               </svg>
-              <p className="text-sm font-medium">Drop images here</p>
+              <p className="text-sm font-medium">
+                {t('input.dropAttachments', { defaultValue: '\u62d6\u62fd\u56fe\u7247\u6216\u6587\u4ef6\u5230\u8fd9\u91cc' })}
+              </p>
             </div>
           </div>
         )}
 
-        {attachedImages.length > 0 && (
+        {(attachedImages.length > 0 || attachedFiles.length > 0) && (
           <div className="mb-2 rounded-xl bg-muted/40 p-2">
             <div className="flex flex-wrap gap-2">
               {attachedImages.map((file, index) => (
@@ -251,6 +267,43 @@ export default function ChatComposer({
                   uploadProgress={uploadingImages.get(file.name)}
                   error={imageErrors.get(file.name)}
                 />
+              ))}
+              {attachedFiles.map((file, index) => (
+                <div
+                  key={`${file.name}-${file.lastModified}-${index}`}
+                  className="group relative flex min-w-[180px] max-w-[240px] items-start gap-2 rounded-xl border border-border/60 bg-background/80 px-3 py-2 shadow-sm"
+                >
+                  <div className="mt-0.5 flex h-8 w-8 flex-shrink-0 items-center justify-center rounded-lg bg-primary/10 text-primary">
+                    <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                        strokeWidth={2}
+                        d="M7 7V5a2 2 0 012-2h6l5 5v11a2 2 0 01-2 2H9a2 2 0 01-2-2V7z"
+                      />
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M14 3v6h6" />
+                    </svg>
+                  </div>
+                  <div className="min-w-0 flex-1">
+                    <div className="truncate text-sm font-medium text-foreground">{file.name}</div>
+                    <div className="text-xs text-muted-foreground">
+                      {Math.max(1, Math.round(file.size / 1024))} KB
+                    </div>
+                    {fileErrors.get(file.name) && (
+                      <div className="mt-1 text-xs text-destructive">{fileErrors.get(file.name)}</div>
+                    )}
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => onRemoveFile(index)}
+                    className="absolute -right-2 -top-2 rounded-full bg-red-500 p-1 text-white opacity-100 transition-opacity focus:opacity-100 sm:opacity-0 sm:group-hover:opacity-100"
+                    aria-label={t('input.removeAttachment', { defaultValue: '\u79fb\u9664\u9644\u4ef6' })}
+                  >
+                    <svg className="h-3 w-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                    </svg>
+                  </button>
+                </div>
               ))}
             </div>
           </div>
@@ -323,23 +376,21 @@ export default function ChatComposer({
               style={{ height: '50px' }}
             />
 
-            {!IS_CODEX_ONLY_HARDENED && (
-              <button
-                type="button"
-                onClick={openImagePicker}
-                className="absolute left-2 top-1/2 -translate-y-1/2 transform rounded-xl p-2 transition-colors hover:bg-accent/60"
-                title={t('input.attachImages')}
-              >
-                <svg className="h-5 w-5 text-muted-foreground" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                    strokeWidth={2}
-                    d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z"
-                  />
-                </svg>
-              </button>
-            )}
+            <button
+              type="button"
+              onClick={openAttachmentPicker}
+              className="absolute left-2 top-1/2 -translate-y-1/2 transform rounded-xl p-2 transition-colors hover:bg-accent/60"
+              title={t('input.attachments', { defaultValue: '\u9644\u52a0\u56fe\u7247\u6216\u6587\u4ef6' })}
+            >
+              <svg className="h-5 w-5 text-muted-foreground" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  strokeWidth={2}
+                  d="M21.44 11.05l-8.49 8.49a6 6 0 11-8.49-8.49l9.19-9.19a4 4 0 115.66 5.66l-9.2 9.19a2 2 0 11-2.82-2.82l8.49-8.48"
+                />
+              </svg>
+            </button>
 
             <div className="absolute right-16 top-1/2 -translate-y-1/2 transform sm:right-16" style={{ display: 'none' }}>
               <MicButton onTranscript={onTranscript} className="h-10 w-10 sm:h-10 sm:w-10" />
@@ -347,7 +398,7 @@ export default function ChatComposer({
 
             <button
               type="submit"
-              disabled={!input.trim() || isLoading}
+              disabled={!hasInput || (isLoading && provider !== 'codex')}
               onMouseDown={(event) => {
                 event.preventDefault();
                 onSubmit(event);

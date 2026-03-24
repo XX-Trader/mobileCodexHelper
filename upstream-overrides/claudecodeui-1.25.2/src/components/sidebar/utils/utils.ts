@@ -53,19 +53,21 @@ export const getSessionDate = (session: SessionWithProvider): Date => {
 };
 
 export const getSessionName = (session: SessionWithProvider, t: TFunction): string => {
+  const normalizedTitle = typeof session.title === 'string' ? session.title.trim() : '';
+
   if (session.__provider === 'cursor') {
-    return session.summary || session.name || t('projects.untitledSession');
+    return normalizedTitle || session.summary || session.name || t('projects.untitledSession');
   }
 
   if (session.__provider === 'codex') {
-    return session.summary || session.name || t('projects.codexSession');
+    return normalizedTitle || session.summary || session.name || t('projects.codexSession');
   }
 
   if (session.__provider === 'gemini') {
-    return session.summary || session.name || t('projects.newSession');
+    return normalizedTitle || session.summary || session.name || t('projects.newSession');
   }
 
-  return session.summary || t('projects.newSession');
+  return normalizedTitle || session.summary || session.name || t('projects.newSession');
 };
 
 export const getSessionTime = (session: SessionWithProvider): string => {

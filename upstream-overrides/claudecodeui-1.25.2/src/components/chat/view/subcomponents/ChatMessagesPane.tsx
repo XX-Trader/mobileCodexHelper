@@ -1,12 +1,13 @@
 import { useTranslation } from 'react-i18next';
-import { useCallback, useMemo, useRef } from 'react';
+import { useCallback, useMemo, useRef, useState } from 'react';
 import type { Dispatch, RefObject, SetStateAction } from 'react';
-import type { ChatMessage } from '../../types/types';
+import type { ChatAttachment, ChatMessage } from '../../types/types';
 import type { Project, ProjectSession, SessionProvider } from '../../../../types/app';
 import { getIntrinsicMessageKey } from '../../utils/messageKeys';
 import MessageComponent from './MessageComponent';
 import ProviderSelectionEmptyState from './ProviderSelectionEmptyState';
 import AssistantThinkingIndicator from './AssistantThinkingIndicator';
+import AttachmentViewer from './AttachmentViewer';
 
 interface ChatMessagesPaneProps {
   scrollContainerRef: RefObject<HTMLDivElement>;
@@ -47,6 +48,7 @@ interface ChatMessagesPaneProps {
   onFileOpen?: (filePath: string, diffInfo?: unknown) => void;
   onShowSettings?: () => void;
   onGrantToolPermission: (suggestion: { entry: string; toolName: string }) => { success: boolean };
+  onRemoveQueuedMessage: (queueId: string) => void;
   autoExpandTools?: boolean;
   showRawParameters?: boolean;
   showThinking?: boolean;
@@ -93,6 +95,7 @@ export default function ChatMessagesPane({
   onFileOpen,
   onShowSettings,
   onGrantToolPermission,
+  onRemoveQueuedMessage,
   autoExpandTools,
   showRawParameters,
   showThinking,
@@ -103,6 +106,7 @@ export default function ChatMessagesPane({
   const messageKeyMapRef = useRef<WeakMap<ChatMessage, string>>(new WeakMap());
   const allocatedKeysRef = useRef<Set<string>>(new Set());
   const generatedMessageKeyCounterRef = useRef(0);
+  const [selectedAttachment, setSelectedAttachment] = useState<ChatAttachment | null>(null);
 
   // Keep keys stable across prepends so existing MessageComponent instances retain local state.
   const getMessageKey = useCallback((message: ChatMessage) => {
@@ -137,6 +141,14 @@ export default function ChatMessagesPane({
       renderKey: getMessageKey(message),
     }));
   }, [getMessageKey, visibleMessages]);
+
+  const handleOpenAttachment = useCallback((attachment: ChatAttachment) => {
+    setSelectedAttachment(attachment);
+  }, []);
+
+  const handleCloseAttachmentViewer = useCallback(() => {
+    setSelectedAttachment(null);
+  }, []);
 
   return (
     <div
@@ -262,11 +274,13 @@ export default function ChatMessagesPane({
                 onFileOpen={onFileOpen}
                 onShowSettings={onShowSettings}
                 onGrantToolPermission={onGrantToolPermission}
+                onRemoveQueuedMessage={onRemoveQueuedMessage}
                 autoExpandTools={autoExpandTools}
                 showRawParameters={showRawParameters}
                 showThinking={showThinking}
                 selectedProject={selectedProject}
                 provider={provider}
+                onOpenAttachment={handleOpenAttachment}
               />
             );
           })}
@@ -274,6 +288,13 @@ export default function ChatMessagesPane({
       )}
 
       {isLoading && <AssistantThinkingIndicator selectedProvider={provider} />}
+
+      <AttachmentViewer
+        attachment={selectedAttachment}
+        projectName={selectedProject.name}
+        isOpen={Boolean(selectedAttachment)}
+        onClose={handleCloseAttachmentViewer}
+      />
     </div>
   );
 }

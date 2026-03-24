@@ -16,12 +16,13 @@ interface ChatInputControlsProps {
   tokenBudget: { used?: number; total?: number } | null;
   slashCommandsCount: number;
   onToggleCommandMenu: () => void;
-  onInsertSupplementBlock: () => void;
   hasInput: boolean;
   onClearInput: () => void;
   isUserScrolledUp: boolean;
   hasMessages: boolean;
   onScrollToBottom: () => void;
+  onScrollToPreviousUserMessage: () => void;
+  onScrollToNextUserMessage: () => void;
 }
 
 export default function ChatInputControls({
@@ -35,12 +36,13 @@ export default function ChatInputControls({
   tokenBudget,
   slashCommandsCount,
   onToggleCommandMenu,
-  onInsertSupplementBlock,
   hasInput,
   onClearInput,
   isUserScrolledUp,
   hasMessages,
   onScrollToBottom,
+  onScrollToPreviousUserMessage,
+  onScrollToNextUserMessage,
 }: ChatInputControlsProps) {
   const { t } = useTranslation('chat');
 
@@ -120,15 +122,6 @@ export default function ChatInputControls({
 
       <TokenUsagePie used={tokenBudget?.used || 0} total={tokenBudget?.total || parseInt(import.meta.env.VITE_CONTEXT_WINDOW) || 160000} />
 
-      <button
-        type="button"
-        onClick={onInsertSupplementBlock}
-        className="rounded-lg border border-border/60 bg-muted/50 px-2.5 py-1 text-sm font-medium text-muted-foreground transition-all duration-200 hover:bg-muted hover:text-foreground sm:px-3 sm:py-1.5"
-        title={t('input.insertSupplement', { defaultValue: 'Insert supplement block' })}
-      >
-        {t('input.insertSupplementShort', { defaultValue: '插入补充' })}
-      </button>
-
       {!IS_CODEX_ONLY_HARDENED && (
         <button
           type="button"
@@ -172,8 +165,37 @@ export default function ChatInputControls({
         </button>
       )}
 
+      {hasMessages && (
+        <button
+          type="button"
+          onClick={onScrollToPreviousUserMessage}
+          className="inline-flex items-center gap-1 rounded-lg border border-border/50 bg-card px-2.5 py-1 text-xs font-medium text-foreground shadow-sm transition-all duration-200 hover:bg-accent/60 sm:px-3 sm:text-sm"
+          title={t('input.jumpToPreviousUserMessage', { defaultValue: '跳到上一条我发送的消息' })}
+        >
+          <svg className="h-3.5 w-3.5 sm:h-4 sm:w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 10l7-7 7 7M12 3v18" />
+          </svg>
+          <span>{t('input.previousUserMessageLabel', { defaultValue: '上一条' })}</span>
+        </button>
+      )}
+
+      {hasMessages && (
+        <button
+          type="button"
+          onClick={onScrollToNextUserMessage}
+          className="inline-flex items-center gap-1 rounded-lg border border-border/50 bg-card px-2.5 py-1 text-xs font-medium text-foreground shadow-sm transition-all duration-200 hover:bg-accent/60 sm:px-3 sm:text-sm"
+          title={t('input.jumpToNextUserMessage', { defaultValue: '跳到下一条我发送的消息' })}
+        >
+          <svg className="h-3.5 w-3.5 sm:h-4 sm:w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 14l-7 7-7-7M12 21V3" />
+          </svg>
+          <span>{t('input.nextUserMessageLabel', { defaultValue: '下一条' })}</span>
+        </button>
+      )}
+
       {isUserScrolledUp && hasMessages && (
         <button
+          type="button"
           onClick={onScrollToBottom}
           className="flex h-7 w-7 items-center justify-center rounded-lg bg-primary text-primary-foreground shadow-sm transition-all duration-200 hover:scale-105 hover:bg-primary/90 sm:h-8 sm:w-8"
           title={t('input.scrollToBottom', { defaultValue: 'Scroll to bottom' })}

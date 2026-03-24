@@ -7,9 +7,9 @@ import type { Project, ProjectSession, SessionProvider } from '../../../types/ap
 import type {
   AdditionalSessionsByProject,
   DeleteProjectConfirmation,
+  HiddenProjectSummary,
   LoadingSessionsByProject,
   ProjectSortOrder,
-  SessionDeleteConfirmation,
   SessionWithProvider,
 } from '../types/types';
 import {
@@ -59,6 +59,24 @@ export type SearchProgress = {
   totalProjects: number;
 };
 
+const readResponseErrorMessage = async (response: Response, fallbackMessage: string): Promise<string> => {
+  try {
+    const responseText = await response.text();
+    if (!responseText.trim()) {
+      return fallbackMessage;
+    }
+
+    try {
+      const parsedError = JSON.parse(responseText) as { error?: string; details?: string };
+      return parsedError.error || parsedError.details || fallbackMessage;
+    } catch {
+      return responseText;
+    }
+  } catch {
+    return fallbackMessage;
+  }
+};
+
 type UseSidebarControllerArgs = {
   projects: Project[];
   selectedProject: Project | null;
@@ -69,8 +87,14 @@ type UseSidebarControllerArgs = {
   onRefresh: () => Promise<void> | void;
   onProjectSelect: (project: Project) => void;
   onSessionSelect: (session: ProjectSession) => void;
-  onSessionDelete?: (sessionId: string) => void;
+  onSessionDelete?: (
+    projectName: string,
+    sessionId: string,
+    sessionTitle: string,
+    provider: SessionProvider,
+  ) => void;
   onProjectDelete?: (projectName: string) => void;
+  onProjectHide?: (projectName: string) => void;
   setCurrentProject: (project: Project) => void;
   setSidebarVisible: (visible: boolean) => void;
   sidebarVisible: boolean;
@@ -88,6 +112,7 @@ export function useSidebarController({
   onSessionSelect,
   onSessionDelete,
   onProjectDelete,
+  onProjectHide,
   setCurrentProject,
   setSidebarVisible,
   sidebarVisible,
@@ -105,12 +130,14 @@ export function useSidebarController({
   const [projectHasMoreOverrides, setProjectHasMoreOverrides] = useState<Record<string, boolean>>({});
   const [editingSession, setEditingSession] = useState<string | null>(null);
   const [editingSessionName, setEditingSessionName] = useState('');
+  const [sessionNameOverrides, setSessionNameOverrides] = useState<Record<string, string>>({});
   const [searchFilter, setSearchFilter] = useState('');
   const [deletingProjects, setDeletingProjects] = useState<Set<string>>(new Set());
   const [deleteConfirmation, setDeleteConfirmation] = useState<DeleteProjectConfirmation | null>(null);
-  const [sessionDeleteConfirmation, setSessionDeleteConfirmation] = useState<SessionDeleteConfirmation | null>(null);
   const [showVersionModal, setShowVersionModal] = useState(false);
   const [starredProjects, setStarredProjects] = useState<Set<string>>(() => loadStarredProjects());
+  const [showHiddenProjects, setShowHiddenProjects] = useState(false);
+  const [hiddenProjectNamesInFlight, setHiddenProjectNamesInFlight] = useState<Set<string>>(new Set());
   const [searchMode, setSearchMode] = useState<'projects' | 'conversations'>('projects');
   const [conversationResults, setConversationResults] = useState<ConversationSearchResults | null>(null);
   const [isSearching, setIsSearching] = useState(false);
@@ -328,9 +355,30 @@ export function useSidebarController({
   );
 
   const getProjectSessions = useCallback(
-    (project: Project) => getAllSessions(project, additionalSessions),
-    [additionalSessions],
+    (project: Project) =>
+      getAllSessions(project, additionalSessions).map((session) => {
+        const overriddenName = sessionNameOverrides[session.id];
+        if (!overriddenName) {
+          return session;
+        }
+
+        return {
+          ...session,
+          title: overriddenName,
+          summary: overriddenName,
+          name: overriddenName,
+        };
+      }),
+    [additionalSessions, sessionNameOverrides],
   );
+
+  const effectiveHiddenProjectNames = useMemo(() => {
+    return new Set(
+      projects
+        .filter((project) => project.isHidden)
+        .map((project) => project.name),
+    );
+  }, [projects]);
 
   const projectsWithSessionMeta = useMemo(
     () =>
@@ -348,9 +396,19 @@ export function useSidebarController({
     [projectHasMoreOverrides, projects],
   );
 
+  const hiddenProjects = useMemo<HiddenProjectSummary[]>(
+    () => projects.filter((project) => effectiveHiddenProjectNames.has(project.name)),
+    [effectiveHiddenProjectNames, projects],
+  );
+
+  const visibleProjects = useMemo(
+    () => projectsWithSessionMeta.filter((project) => !effectiveHiddenProjectNames.has(project.name)),
+    [effectiveHiddenProjectNames, projectsWithSessionMeta],
+  );
+
   const sortedProjects = useMemo(
-    () => sortProjects(projectsWithSessionMeta, projectSortOrder, starredProjects, additionalSessions),
-    [additionalSessions, projectSortOrder, projectsWithSessionMeta, starredProjects],
+    () => sortProjects(visibleProjects, projectSortOrder, starredProjects, additionalSessions),
+    [additionalSessions, projectSortOrder, starredProjects, visibleProjects],
   );
 
   const filteredProjects = useMemo(
@@ -402,51 +460,12 @@ export function useSidebarController({
       projectName: string,
       sessionId: string,
       sessionTitle: string,
-      provider: SessionDeleteConfirmation['provider'] = 'claude',
+      provider: SessionProvider = 'claude',
     ) => {
-      setSessionDeleteConfirmation({ projectName, sessionId, sessionTitle, provider });
+      onSessionDelete?.(projectName, sessionId, sessionTitle, provider);
     },
-    [],
+    [onSessionDelete],
   );
-
-  const confirmDeleteSession = useCallback(async () => {
-    if (!sessionDeleteConfirmation) {
-      return;
-    }
-
-    if (IS_CODEX_ONLY_HARDENED) {
-      setSessionDeleteConfirmation(null);
-      return;
-    }
-
-    const { projectName, sessionId, provider } = sessionDeleteConfirmation;
-    setSessionDeleteConfirmation(null);
-
-    try {
-      let response;
-      if (provider === 'codex') {
-        response = await api.deleteCodexSession(sessionId);
-      } else if (provider === 'gemini') {
-        response = await api.deleteGeminiSession(sessionId);
-      } else {
-        response = await api.deleteSession(projectName, sessionId);
-      }
-
-      if (response.ok) {
-        onSessionDelete?.(sessionId);
-      } else {
-        const errorText = await response.text();
-        console.error('[Sidebar] Failed to delete session:', {
-          status: response.status,
-          error: errorText,
-        });
-        alert(t('messages.deleteSessionFailed'));
-      }
-    } catch (error) {
-      console.error('[Sidebar] Error deleting session:', error);
-      alert(t('messages.deleteSessionError'));
-    }
-  }, [onSessionDelete, sessionDeleteConfirmation, t]);
 
   const requestProjectDelete = useCallback(
     (project: Project) => {
@@ -561,7 +580,8 @@ export function useSidebarController({
 
   const updateSessionSummary = useCallback(
     async (_projectName: string, sessionId: string, summary: string, provider: SessionProvider) => {
-      if (IS_CODEX_ONLY_HARDENED) {
+      const canRenameSession = !IS_CODEX_ONLY_HARDENED || provider === 'codex';
+      if (!canRenameSession) {
         setEditingSession(null);
         setEditingSessionName('');
         return;
@@ -576,6 +596,10 @@ export function useSidebarController({
       try {
         const response = await api.renameSession(sessionId, trimmed, provider);
         if (response.ok) {
+          setSessionNameOverrides((previous) => ({
+            ...previous,
+            [sessionId]: trimmed,
+          }));
           await onRefresh();
         } else {
           console.error('[Sidebar] Failed to rename session:', response.status);
@@ -591,6 +615,73 @@ export function useSidebarController({
     },
     [onRefresh, t],
   );
+
+  const hideProjectFromSidebar = useCallback(async (project: Project) => {
+    setHiddenProjectNamesInFlight((previous) => {
+      const next = new Set(previous);
+      next.add(project.name);
+      return next;
+    });
+
+    try {
+      const response = await api.setProjectHiddenState(project.name, true);
+      if (!response.ok) {
+        const errorText = await readResponseErrorMessage(response, t('messages.hideProjectFailed'));
+        console.error('[Sidebar] Failed to hide project:', {
+          projectName: project.name,
+          status: response.status,
+          error: errorText,
+        });
+        alert(errorText);
+        return;
+      }
+
+      onProjectHide?.(project.name);
+      await onRefresh();
+    } catch (error) {
+      console.error('[Sidebar] Error hiding project:', error);
+      alert(t('messages.hideProjectError'));
+    } finally {
+      setHiddenProjectNamesInFlight((previous) => {
+        const next = new Set(previous);
+        next.delete(project.name);
+        return next;
+      });
+    }
+  }, [onProjectHide, onRefresh, t]);
+
+  const restoreHiddenProject = useCallback(async (projectName: string) => {
+    setHiddenProjectNamesInFlight((previous) => {
+      const next = new Set(previous);
+      next.add(projectName);
+      return next;
+    });
+
+    try {
+      const response = await api.setProjectHiddenState(projectName, false);
+      if (!response.ok) {
+        const errorText = await readResponseErrorMessage(response, t('messages.restoreProjectFailed'));
+        console.error('[Sidebar] Failed to restore project:', {
+          projectName,
+          status: response.status,
+          error: errorText,
+        });
+        alert(errorText);
+        return;
+      }
+
+      await onRefresh();
+    } catch (error) {
+      console.error('[Sidebar] Error restoring project:', error);
+      alert(t('messages.restoreProjectError'));
+    } finally {
+      setHiddenProjectNamesInFlight((previous) => {
+        const next = new Set(previous);
+        next.delete(projectName);
+        return next;
+      });
+    }
+  }, [onRefresh, t]);
 
   const collapseSidebar = useCallback(() => {
     setSidebarVisible(false);
@@ -617,7 +708,9 @@ export function useSidebarController({
     searchFilter,
     deletingProjects,
     deleteConfirmation,
-    sessionDeleteConfirmation,
+    showHiddenProjects,
+    hiddenProjects,
+    hiddenProjectNamesInFlight,
     showVersionModal,
     starredProjects,
     filteredProjects,
@@ -630,7 +723,8 @@ export function useSidebarController({
     cancelEditing,
     saveProjectName,
     showDeleteSessionConfirmation,
-    confirmDeleteSession,
+    hideProjectFromSidebar,
+    restoreHiddenProject,
     requestProjectDelete,
     confirmDeleteProject,
     loadMoreSessions,
@@ -660,7 +754,7 @@ export function useSidebarController({
     }, []),
     setSearchFilter,
     setDeleteConfirmation,
-    setSessionDeleteConfirmation,
+    setShowHiddenProjects,
     setShowVersionModal,
   };
 }

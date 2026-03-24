@@ -32,6 +32,7 @@ function MainContent({
   selectedProject,
   selectedSession,
   activeTab,
+  mountedTabs,
   setActiveTab,
   ws,
   sendMessage,
@@ -44,15 +45,20 @@ function MainContent({
   onSessionInactive,
   onSessionProcessing,
   onSessionNotProcessing,
-  processingSessions,
   onReplaceTemporarySession,
+  onCreateOptimisticSession,
+  onReplaceOptimisticSession,
   onNavigateToSession,
   onShowSettings,
   externalMessageUpdate,
-  selectedSessionHasUnread,
+  getSessionViewChatRuntimeForTarget,
+  updateSessionViewChatRuntimeForTarget,
+  hasUnreadSelectedSession,
+  onAcknowledgeUnreadSession,
   recentSessions,
   onRecentSessionSelect,
   onRecentSessionDismiss,
+  onDeleteCurrentSession,
 }: MainContentProps) {
   const { preferences } = useUiPreferences();
   const { autoExpandTools, showRawParameters, showThinking, autoScrollToBottom, sendByCtrlEnter } = preferences;
@@ -125,6 +131,7 @@ function MainContent({
         recentSessions={recentSessions}
         onRecentSessionSelect={onRecentSessionSelect}
         onRecentSessionDismiss={onRecentSessionDismiss}
+        onDeleteCurrentSession={onDeleteCurrentSession}
       />
       <div className="flex min-h-0 flex-1 overflow-hidden">
         <div className={`flex min-h-0 min-w-[200px] flex-col overflow-hidden ${editorExpanded ? 'hidden' : ''} flex-1`}>
@@ -142,8 +149,9 @@ function MainContent({
                 onSessionInactive={onSessionInactive}
                 onSessionProcessing={onSessionProcessing}
                 onSessionNotProcessing={onSessionNotProcessing}
-                processingSessions={processingSessions}
                 onReplaceTemporarySession={onReplaceTemporarySession}
+                onCreateOptimisticSession={onCreateOptimisticSession}
+                onReplaceOptimisticSession={onReplaceOptimisticSession}
                 onNavigateToSession={onNavigateToSession}
                 onShowSettings={onShowSettings}
                 autoExpandTools={autoExpandTools}
@@ -152,20 +160,24 @@ function MainContent({
                 autoScrollToBottom={autoScrollToBottom}
                 sendByCtrlEnter={sendByCtrlEnter}
                 externalMessageUpdate={externalMessageUpdate}
-                selectedSessionHasUnread={selectedSessionHasUnread}
+                getSessionViewChatRuntimeForTarget={getSessionViewChatRuntimeForTarget}
+                updateSessionViewChatRuntimeForTarget={updateSessionViewChatRuntimeForTarget}
+                isChatTabActive={activeTab === 'chat'}
+                hasUnreadSelectedSession={hasUnreadSelectedSession}
+                onAcknowledgeUnreadSession={onAcknowledgeUnreadSession}
                 onShowAllTasks={tasksEnabled ? () => setActiveTab('tasks') : null}
               />
             </ErrorBoundary>
           </div>
 
-          {!IS_CODEX_ONLY_HARDENED && activeTab === 'files' && (
-            <div className="h-full overflow-hidden">
+          {!IS_CODEX_ONLY_HARDENED && mountedTabs.includes('files') && (
+            <div className={`h-full overflow-hidden ${activeTab === 'files' ? 'block' : 'hidden'}`}>
               <FileTree selectedProject={selectedProject} onFileOpen={handleFileOpen} />
             </div>
           )}
 
-          {!IS_CODEX_ONLY_HARDENED && activeTab === 'shell' && (
-            <div className="h-full w-full overflow-hidden">
+          {!IS_CODEX_ONLY_HARDENED && mountedTabs.includes('shell') && (
+            <div className={`h-full w-full overflow-hidden ${activeTab === 'shell' ? 'block' : 'hidden'}`}>
               <StandaloneShell
                 project={selectedProject}
                 session={selectedSession}
@@ -175,25 +187,35 @@ function MainContent({
             </div>
           )}
 
-          {!IS_CODEX_ONLY_HARDENED && activeTab === 'git' && (
-            <div className="h-full overflow-hidden">
+          {!IS_CODEX_ONLY_HARDENED && mountedTabs.includes('git') && (
+            <div className={`h-full overflow-hidden ${activeTab === 'git' ? 'block' : 'hidden'}`}>
               <GitPanel selectedProject={selectedProject} isMobile={isMobile} onFileOpen={handleFileOpen} />
             </div>
           )}
 
-          {!IS_CODEX_ONLY_HARDENED && shouldShowTasksTab && <TaskMasterPanel isVisible={activeTab === 'tasks'} />}
-
-          {!IS_CODEX_ONLY_HARDENED && <div className={`h-full overflow-hidden ${activeTab === 'preview' ? 'block' : 'hidden'}`} />}
-
-          {!IS_CODEX_ONLY_HARDENED && activeTab.startsWith('plugin:') && (
-            <div className="h-full overflow-hidden">
-              <PluginTabContent
-                pluginName={activeTab.replace('plugin:', '')}
-                selectedProject={selectedProject}
-                selectedSession={selectedSession}
-              />
-            </div>
+          {!IS_CODEX_ONLY_HARDENED && shouldShowTasksTab && mountedTabs.includes('tasks') && (
+            <TaskMasterPanel isVisible={activeTab === 'tasks'} />
           )}
+
+          {!IS_CODEX_ONLY_HARDENED && mountedTabs.includes('preview') && (
+            <div className={`h-full overflow-hidden ${activeTab === 'preview' ? 'block' : 'hidden'}`} />
+          )}
+
+          {!IS_CODEX_ONLY_HARDENED &&
+            mountedTabs
+              .filter((tab): tab is `plugin:${string}` => tab.startsWith('plugin:'))
+              .map((pluginTab) => (
+                <div
+                  key={pluginTab}
+                  className={`h-full overflow-hidden ${activeTab === pluginTab ? 'block' : 'hidden'}`}
+                >
+                  <PluginTabContent
+                    pluginName={pluginTab.replace('plugin:', '')}
+                    selectedProject={selectedProject}
+                    selectedSession={selectedSession}
+                  />
+                </div>
+              ))}
         </div>
 
         {!IS_CODEX_ONLY_HARDENED && (

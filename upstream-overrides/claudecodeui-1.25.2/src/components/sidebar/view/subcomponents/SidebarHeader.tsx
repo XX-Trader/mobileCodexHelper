@@ -1,4 +1,4 @@
-import { Folder, FolderPlus, MessageSquare, Plus, RefreshCw, Search, X, PanelLeftClose } from 'lucide-react';
+import { EyeOff, Folder, FolderPlus, MessageSquare, Plus, RefreshCw, Search, X, PanelLeftClose } from 'lucide-react';
 import type { TFunction } from 'i18next';
 import { Button, Input } from '../../../../shared/view/ui';
 import { IS_CODEX_ONLY_HARDENED, IS_PLATFORM } from '../../../../constants/config';
@@ -19,10 +19,15 @@ type SidebarHeaderProps = {
   onRefresh: () => void;
   isRefreshing: boolean;
   onCreateProject: () => void;
+  hiddenProjectsCount: number;
+  onShowHiddenProjects: () => void;
   onCollapseSidebar: () => void;
   t: TFunction;
 };
 
+/**
+ * 渲染侧边栏头部工具区，并提供项目搜索、刷新、创建与已隐藏项目入口。
+ */
 export default function SidebarHeader({
   isPWA,
   isMobile,
@@ -36,6 +41,8 @@ export default function SidebarHeader({
   onRefresh,
   isRefreshing,
   onCreateProject,
+  hiddenProjectsCount,
+  onShowHiddenProjects,
   onCollapseSidebar,
   t,
 }: SidebarHeaderProps) {
@@ -94,6 +101,17 @@ export default function SidebarHeader({
             >
               <Plus className="h-3.5 w-3.5" />
             </Button>
+            {hiddenProjectsCount > 0 && (
+              <Button
+                variant="ghost"
+                size="sm"
+                className="h-7 w-7 rounded-lg p-0 text-muted-foreground hover:bg-accent/80 hover:text-foreground"
+                onClick={onShowHiddenProjects}
+                title={t('tooltips.viewHiddenProjects')}
+              >
+                <EyeOff className="h-3.5 w-3.5" />
+              </Button>
+            )}
             <Button
               variant="ghost"
               size="sm"
@@ -194,8 +212,20 @@ export default function SidebarHeader({
               <button
                 className="flex h-8 w-8 items-center justify-center rounded-lg bg-primary/90 text-primary-foreground transition-all active:scale-95"
                 onClick={onCreateProject}
+                aria-label={t('tooltips.createProject')}
+                title={t('tooltips.createProject')}
               >
                 <FolderPlus className="h-4 w-4" />
+              </button>
+            )}
+            {hiddenProjectsCount > 0 && (
+              <button
+                className="flex h-8 w-8 items-center justify-center rounded-lg bg-muted/50 transition-all active:scale-95"
+                onClick={onShowHiddenProjects}
+                aria-label={t('tooltips.viewHiddenProjects')}
+                title={t('tooltips.viewHiddenProjects')}
+              >
+                <EyeOff className="h-4 w-4 text-muted-foreground" />
               </button>
             )}
           </div>

@@ -1,15 +1,21 @@
-import { useCallback, useRef, useState, useEffect } from 'react';
-import { Bell, BellOff, X } from 'lucide-react';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { useTranslation } from 'react-i18next';
+import { Bell, BellOff, Trash2, X } from 'lucide-react';
 import type { MainContentHeaderProps } from '../../types/types';
 import MobileMenuButton from './MobileMenuButton';
 import MainContentTabSwitcher from './MainContentTabSwitcher';
 import MainContentTitle from './MainContentTitle';
 import DarkModeToggle from '../../../../shared/view/ui/DarkModeToggle';
+import { IS_CODEX_ONLY_HARDENED } from '../../../../constants/config';
 import { useUiPreferences } from '../../../../hooks/useUiPreferences';
+import type { SessionProvider } from '../../../../types/app';
 import SessionProviderLogo from '../../../llm-logo-provider/SessionProviderLogo';
 
 const CHAT_SCROLL_DEBUG_STORAGE_KEY = 'chat-scroll-debug';
 const CHAT_SCROLL_DEBUG_QUERY_KEY = 'chatScrollDebug';
+
+const resolveSessionProvider = (provider?: SessionProvider): SessionProvider =>
+  provider || (IS_CODEX_ONLY_HARDENED ? 'codex' : 'claude');
 
 const isChatScrollDebugEnabled = () => {
   if (typeof window === 'undefined') {
@@ -26,6 +32,33 @@ const isChatScrollDebugEnabled = () => {
   );
 };
 
+function RecentSessionStatusIndicators({
+  isProcessing,
+  hasUnread,
+}: {
+  isProcessing: boolean;
+  hasUnread: boolean;
+}) {
+  return (
+    <span className="inline-flex flex-shrink-0 items-center gap-1" aria-hidden="true">
+      <span
+        className={`h-2.5 w-2.5 rounded-full ${
+          isProcessing
+            ? 'bg-emerald-400/80 shadow-[0_0_0_2px_rgba(74,222,128,0.14)]'
+            : 'bg-transparent'
+        }`}
+      />
+      <span
+        className={`h-2.5 w-2.5 rounded-full ${
+          hasUnread
+            ? 'bg-rose-400/80 shadow-[0_0_0_2px_rgba(251,113,133,0.14)]'
+            : 'bg-transparent'
+        }`}
+      />
+    </span>
+  );
+}
+
 export default function MainContentHeader({
   activeTab,
   setActiveTab,
@@ -37,14 +70,25 @@ export default function MainContentHeader({
   recentSessions,
   onRecentSessionSelect,
   onRecentSessionDismiss,
+  onDeleteCurrentSession,
 }: MainContentHeaderProps) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const headerRef = useRef<HTMLDivElement>(null);
   const [canScrollLeft, setCanScrollLeft] = useState(false);
   const [canScrollRight, setCanScrollRight] = useState(false);
+  const { t } = useTranslation('sidebar');
   const { preferences, setPreference } = useUiPreferences();
   const shouldReserveRecentSessionsRow = activeTab === 'chat';
   const shouldShowRecentSessions = recentSessions.length > 0;
+  const currentSessionProvider = selectedSession ? resolveSessionProvider(selectedSession.__provider) : null;
+  const canDeleteCurrentSession =
+    activeTab === 'chat' &&
+    Boolean(
+      selectedSession &&
+      currentSessionProvider &&
+      currentSessionProvider !== 'cursor' &&
+      (!IS_CODEX_ONLY_HARDENED || currentSessionProvider === 'codex'),
+    );
 
   const logHeaderDebug = useCallback((event: string, payload: Record<string, unknown> = {}) => {
     if (!isChatScrollDebugEnabled()) {
@@ -65,18 +109,35 @@ export default function MainContentHeader({
   }, [activeTab, recentSessions.length, selectedProject?.name, selectedSession?.id, shouldShowRecentSessions]);
 
   const updateScrollState = useCallback(() => {
-    const el = scrollRef.current;
-    if (!el) return;
-    setCanScrollLeft(el.scrollLeft > 2);
-    setCanScrollRight(el.scrollLeft < el.scrollWidth - el.clientWidth - 2);
+    const container = scrollRef.current;
+    if (!container) {
+      return;
+    }
+
+    setCanScrollLeft(container.scrollLeft > 2);
+    setCanScrollRight(container.scrollLeft < container.scrollWidth - container.clientWidth - 2);
   }, []);
 
+  const handleDeleteCurrentSession = useCallback(() => {
+    if (!selectedSession || !currentSessionProvider) {
+      return;
+    }
+
+    const sessionTitle =
+      selectedSession.title || selectedSession.summary || selectedSession.name || t('sessions.unnamed');
+
+    onDeleteCurrentSession(selectedProject.name, selectedSession.id, sessionTitle, currentSessionProvider);
+  }, [currentSessionProvider, onDeleteCurrentSession, selectedProject.name, selectedSession, t]);
+
   useEffect(() => {
-    const el = scrollRef.current;
-    if (!el) return;
+    const container = scrollRef.current;
+    if (!container) {
+      return;
+    }
+
     updateScrollState();
     const observer = new ResizeObserver(updateScrollState);
-    observer.observe(el);
+    observer.observe(container);
     return () => observer.disconnect();
   }, [updateScrollState]);
 
@@ -124,6 +185,17 @@ export default function MainContentHeader({
             >
               {preferences.browserNotifications ? <Bell className="h-4 w-4" /> : <BellOff className="h-4 w-4" />}
             </button>
+            {canDeleteCurrentSession && (
+              <button
+                type="button"
+                onClick={handleDeleteCurrentSession}
+                className="flex h-9 w-9 items-center justify-center rounded-full border border-red-200 bg-red-50 text-red-600 transition-colors hover:bg-red-100 dark:border-red-900/60 dark:bg-red-900/20 dark:text-red-400 dark:hover:bg-red-900/40"
+                title={t('tooltips.deleteSession')}
+                aria-label={t('tooltips.deleteSession')}
+              >
+                <Trash2 className="h-4 w-4" />
+              </button>
+            )}
             <DarkModeToggle ariaLabel="切换夜间模式" />
             <div className="relative min-w-0 overflow-hidden">
               {canScrollLeft && (
@@ -154,16 +226,12 @@ export default function MainContentHeader({
             <div className="flex min-w-max items-center gap-2">
               {recentSessions.map((sessionShortcut) => {
                 const isSelected = selectedSession?.id === sessionShortcut.sessionId;
-                const statusDotClass = sessionShortcut.hasUnread
-                  ? 'bg-rose-500 shadow-[0_0_0_2px_rgba(244,63,94,0.18)]'
-                  : sessionShortcut.isProcessing
-                    ? 'bg-emerald-500 shadow-[0_0_0_2px_rgba(16,185,129,0.18)]'
-                    : 'bg-muted-foreground/20';
-                const statusLabel = sessionShortcut.hasUnread
-                  ? '未读'
-                  : sessionShortcut.isProcessing
-                    ? '处理中'
-                    : '已读';
+                const statusLabel = [
+                  sessionShortcut.isProcessing ? '处理中' : null,
+                  sessionShortcut.hasUnread ? '未读' : null,
+                ]
+                  .filter(Boolean)
+                  .join(' / ') || '已读';
 
                 return (
                   <div
@@ -178,10 +246,13 @@ export default function MainContentHeader({
                     <button
                       type="button"
                       onClick={() => onRecentSessionSelect(sessionShortcut.sessionId)}
-                      className="flex min-w-0 flex-1 items-center gap-2 pl-3 pr-1.5 py-1"
+                      className="flex min-w-0 flex-1 items-center gap-2 py-1 pl-3 pr-1.5"
                       title={`${sessionShortcut.projectName} / ${sessionShortcut.sessionTitle} (${statusLabel})`}
                     >
-                      <span className={`h-2.5 w-2.5 flex-shrink-0 rounded-full ${statusDotClass}`} aria-hidden="true" />
+                      <RecentSessionStatusIndicators
+                        isProcessing={sessionShortcut.isProcessing}
+                        hasUnread={sessionShortcut.hasUnread}
+                      />
                       <SessionProviderLogo provider={sessionShortcut.provider} className="h-3 w-3 flex-shrink-0" />
                       <span className="truncate font-medium">{sessionShortcut.sessionTitle}</span>
                     </button>
@@ -196,8 +267,8 @@ export default function MainContentHeader({
                           ? 'text-primary/80 hover:bg-primary/10 hover:text-primary'
                           : 'text-muted-foreground/80 hover:bg-muted hover:text-foreground'
                       }`}
-                      aria-label={`从最近会话中移除 ${sessionShortcut.sessionTitle}`}
-                      title={`从最近会话中移除 ${sessionShortcut.sessionTitle}`}
+                      aria-label={`仅从最近列表移除 ${sessionShortcut.sessionTitle}`}
+                      title={`仅从最近列表移除 ${sessionShortcut.sessionTitle}`}
                     >
                       <X className="h-3 w-3" />
                     </button>

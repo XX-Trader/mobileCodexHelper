@@ -21,18 +21,105 @@ type CodeBlockProps = {
   inline?: boolean;
   className?: string;
   children?: React.ReactNode;
+  projectName?: string;
+  currentFilePath?: string;
 };
 
-const CodeBlock = ({ node, inline, className, children, ...props }: CodeBlockProps) => {
+const EXTERNAL_LINK_PATTERN = /^(?:[a-z][a-z\d+\-.]*:|\/\/|#)/i;
+const MARKDOWN_FILE_EXTENSION_PATTERN = /\.(md|markdown)$/i;
+const MARKDOWN_AUTOLINK_SKIP_PATTERN = /(?:```[\s\S]*?```|`[^`\n]+`|!?\[[^\]]*]\([^)]+\))/g;
+const MARKDOWN_FILE_PATH_PATTERN =
+  /(^|[\s(>\[{'"\u201c\u2018\uFF1A:\uFF08\u3010\u300A\uFF0C\u3002\uFF1B\u3001])((?:\.\.?[\\/]|\/|[a-zA-Z]:[\\/])?(?:[^\s`[\](){}<>]+[\\/])*[^\s`[\](){}<>]+\.(?:md|markdown)(?:#[A-Za-z0-9._~!$&'()*+,;=:@/%-]+)?)(?=$|[\s)\].,!?;:'"\u201d\u2019\uFF09\u3011\u300B\uFF0C\u3002\uFF1B\u3001])/gi;
+
+const decodeUriComponentSafely = (value: string) => {
+  let decodedValue = value;
+
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    if (!decodedValue.includes('%')) {
+      break;
+    }
+
+    try {
+      const nextValue = decodeURIComponent(decodedValue);
+      if (nextValue === decodedValue) {
+        break;
+      }
+      decodedValue = nextValue;
+    } catch {
+      break;
+    }
+  }
+
+  return decodedValue;
+};
+
+/**
+ * Normalizes a file-preview path for routing and API calls.
+ *
+ * @param rawPath Raw path string; may include backslashes, URL encoding, or `/C:/` drive prefixes.
+ * @returns Normalized path using forward slashes, or an empty string when the input is empty.
+ * @throws Does not throw. Invalid URI escape sequences are preserved as-is.
+ */
+export const normalizePreviewFilePath = (rawPath: string) => {
+  const normalizedInput = decodeUriComponentSafely(rawPath.replace(/\\/g, '/').trim());
+  if (/^\/[a-zA-Z]:\//.test(normalizedInput)) {
+    return normalizedInput.slice(1);
+  }
+
+  return normalizedInput;
+};
+
+const isMarkdownFileReference = (value: string) => {
+  const normalizedPath = normalizePreviewFilePath(value);
+  const pathnameOnly = normalizedPath.split('#', 1)[0].split('?', 1)[0];
+  return MARKDOWN_FILE_EXTENSION_PATTERN.test(pathnameOnly);
+};
+
+const autoLinkMarkdownFilePathsInSegment = (segment: string) =>
+  segment.replace(MARKDOWN_FILE_PATH_PATTERN, (match, prefix: string, rawPath: string) => {
+    if (!isMarkdownFileReference(rawPath)) {
+      return match;
+    }
+
+    return `${prefix}[${rawPath}](${rawPath})`;
+  });
+
+const autoLinkMarkdownFilePaths = (markdownContent: string) => {
+  if (!/\.(?:md|markdown)\b/i.test(markdownContent)) {
+    return markdownContent;
+  }
+
+  const skipMatcher = new RegExp(MARKDOWN_AUTOLINK_SKIP_PATTERN.source, 'g');
+  let lastIndex = 0;
+  let result = '';
+  let match: RegExpExecArray | null = skipMatcher.exec(markdownContent);
+
+  while (match) {
+    result += autoLinkMarkdownFilePathsInSegment(markdownContent.slice(lastIndex, match.index));
+    result += match[0];
+    lastIndex = match.index + match[0].length;
+    match = skipMatcher.exec(markdownContent);
+  }
+
+  result += autoLinkMarkdownFilePathsInSegment(markdownContent.slice(lastIndex));
+  return result;
+};
+
+const CodeBlock = ({ node, inline, className, children, projectName, currentFilePath, ...props }: CodeBlockProps) => {
   const { t } = useTranslation('chat');
   const [copied, setCopied] = useState(false);
   const raw = Array.isArray(children) ? children.join('') : String(children ?? '');
   const looksMultiline = /[\r\n]/.test(raw);
   const inlineDetected = inline || (node && node.type === 'inlineCode');
   const shouldInline = inlineDetected || !looksMultiline;
+  const inlineFileReference = raw.trim();
+  const inlineFileHref =
+    shouldInline && projectName && isMarkdownFileReference(inlineFileReference)
+      ? resolveMarkdownPreviewHref(inlineFileReference, { projectName, currentFilePath })
+      : '';
 
   if (shouldInline) {
-    return (
+    const inlineCode = (
       <code
         className={`whitespace-pre-wrap break-words rounded-md border border-gray-200 bg-gray-100 px-1.5 py-0.5 font-mono text-[0.9em] text-gray-900 dark:border-gray-700 dark:bg-gray-800/60 dark:text-gray-100 ${className || ''
           }`}
@@ -41,6 +128,21 @@ const CodeBlock = ({ node, inline, className, children, ...props }: CodeBlockPro
         {children}
       </code>
     );
+
+    if (inlineFileHref) {
+      return (
+        <a
+          href={inlineFileHref}
+          className="inline-flex max-w-full align-baseline"
+          target="_blank"
+          rel="noopener noreferrer"
+        >
+          {inlineCode}
+        </a>
+      );
+    }
+
+    return inlineCode;
   }
 
   const match = /language-(\w+)/.exec(className || '');
@@ -118,39 +220,6 @@ const CodeBlock = ({ node, inline, className, children, ...props }: CodeBlockPro
   );
 };
 
-const EXTERNAL_LINK_PATTERN = /^(?:[a-z][a-z\d+\-.]*:|\/\/|#)/i;
-
-const decodeUriComponentSafely = (value: string) => {
-  let decodedValue = value;
-
-  for (let attempt = 0; attempt < 2; attempt += 1) {
-    if (!decodedValue.includes('%')) {
-      break;
-    }
-
-    try {
-      const nextValue = decodeURIComponent(decodedValue);
-      if (nextValue === decodedValue) {
-        break;
-      }
-      decodedValue = nextValue;
-    } catch {
-      break;
-    }
-  }
-
-  return decodedValue;
-};
-
-export const normalizePreviewFilePath = (rawPath: string) => {
-  const normalizedInput = decodeUriComponentSafely(rawPath.replace(/\\/g, '/').trim());
-  if (/^\/[a-zA-Z]:\//.test(normalizedInput)) {
-    return normalizedInput.slice(1);
-  }
-
-  return normalizedInput;
-};
-
 const normalizePathSegments = (inputPath: string) => {
   const isAbsolutePath = inputPath.startsWith('/');
   const segments = inputPath.split('/').filter((segment) => segment.length > 0);
@@ -206,6 +275,14 @@ const resolveMarkdownFilePath = (href: string, currentFilePath?: string) => {
   return normalizePathSegments(`${currentDirectory}/${pathOnly}`);
 };
 
+/**
+ * Builds a `/file-preview` route for a project file.
+ *
+ * @param projectName Project name; must be present so the preview page can resolve the workspace.
+ * @param filePath File path inside the project; supports relative paths, drive-letter paths, and URL-encoded input.
+ * @returns Router href pointing to the file preview page.
+ * @throws Does not throw. Unexpected paths are still encoded into the route.
+ */
 export const buildFilePreviewHref = (projectName: string, filePath: string) => {
   const baseName = typeof window !== 'undefined' ? window.__ROUTER_BASENAME__ || '' : '';
   const normalizedFilePath = normalizePreviewFilePath(filePath);
@@ -214,6 +291,15 @@ export const buildFilePreviewHref = (projectName: string, filePath: string) => {
   return `${baseName}/file-preview?projectName=${encodedProjectName}&filePath=${encodedFilePath}`;
 };
 
+/**
+ * Resolves Markdown file links to the preview page while preserving external links.
+ *
+ * @param href Raw Markdown href; may be relative, absolute, external, or an anchor.
+ * @param options.projectName Current project name; required for generating preview links.
+ * @param options.currentFilePath Current Markdown file path; used to resolve relative links.
+ * @returns A href suitable for rendering in `<a href>`. Falls back to the original href when unresolved.
+ * @throws Does not throw. Resolution failures return the original href.
+ */
 export const resolveMarkdownPreviewHref = (
   href: string | undefined,
   options: { projectName?: string; currentFilePath?: string } = {},
@@ -231,12 +317,28 @@ export const resolveMarkdownPreviewHref = (
   return `${buildFilePreviewHref(options.projectName, resolvedFilePath)}${hashPart}`;
 };
 
+/**
+ * Renders shared Markdown content for chat messages and file previews.
+ *
+ * @param children Raw Markdown content; may include code fences, tables, math, and local file paths.
+ * @param className Optional wrapper class name.
+ * @param projectName Current project name; used to resolve local files to the preview page.
+ * @param currentFilePath Current Markdown file path; used to resolve relative links.
+ * @returns Rendered Markdown element tree.
+ * @throws Does not throw directly. Rendering failures are handled by React error boundaries.
+ */
 export function Markdown({ children, className, projectName, currentFilePath }: MarkdownProps) {
-  const content = normalizeInlineCodeFences(String(children ?? ''));
+  const content = autoLinkMarkdownFilePaths(normalizeInlineCodeFences(String(children ?? '')));
   const remarkPlugins = useMemo(() => [remarkGfm, remarkMath], []);
   const rehypePlugins = useMemo(() => [rehypeKatex], []);
   const markdownComponents = useMemo(() => ({
-    code: CodeBlock,
+    code: (props: CodeBlockProps) => (
+      <CodeBlock
+        {...props}
+        projectName={projectName}
+        currentFilePath={currentFilePath}
+      />
+    ),
     blockquote: ({ children: blockquoteChildren }: { children?: React.ReactNode }) => (
       <blockquote className="my-2 border-l-4 border-gray-300 pl-4 italic text-gray-600 dark:border-gray-600 dark:text-gray-400">
         {blockquoteChildren}

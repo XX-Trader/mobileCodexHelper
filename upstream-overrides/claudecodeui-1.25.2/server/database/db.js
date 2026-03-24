@@ -24,11 +24,18 @@ const c = {
 
 const DEFAULT_PREFERRED_LANGUAGE = 'zh-CN';
 const SUPPORTED_PREFERRED_LANGUAGES = new Set(['en', 'ko', 'zh-CN', 'ja', 'ru']);
+const SESSION_NOTIFICATION_PROVIDERS = new Set(['claude', 'codex', 'cursor', 'gemini']);
 
 const normalizePreferredLanguage = (language) => (
   typeof language === 'string' && SUPPORTED_PREFERRED_LANGUAGES.has(language)
     ? language
     : DEFAULT_PREFERRED_LANGUAGE
+);
+
+const normalizeSessionNotificationProvider = (provider) => (
+  typeof provider === 'string' && SESSION_NOTIFICATION_PROVIDERS.has(provider)
+    ? provider
+    : null
 );
 
 // Use DATABASE_PATH environment variable if set, otherwise use default location
@@ -143,6 +150,19 @@ const runMigrations = () => {
       UNIQUE(session_id, provider)
     )`);
     db.exec('CREATE INDEX IF NOT EXISTS idx_session_auto_titles_lookup ON session_auto_titles(session_id, provider)');
+
+    db.exec(`CREATE TABLE IF NOT EXISTS session_notifications (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER NOT NULL,
+      session_id TEXT NOT NULL,
+      provider TEXT NOT NULL DEFAULT 'claude',
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+      UNIQUE(user_id, session_id, provider)
+    )`);
+    db.exec('CREATE INDEX IF NOT EXISTS idx_session_notifications_user_id ON session_notifications(user_id)');
+    db.exec('CREATE INDEX IF NOT EXISTS idx_session_notifications_lookup ON session_notifications(user_id, session_id, provider)');
 
     db.exec(`CREATE TABLE IF NOT EXISTS trusted_devices (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -774,6 +794,92 @@ const sessionAutoTitlesDb = {
   },
 };
 
+/**
+ * Session unread-completion notification persistence helpers.
+ * Keeps unread state on the server so refreshes, reconnects, and other tabs stay synchronized.
+ */
+const sessionNotificationsDb = {
+  getUnreadCompletedSessions: (userId) => {
+    if (!userId) {
+      return [];
+    }
+
+    const rows = db.prepare(`
+      SELECT session_id, MAX(updated_at) AS latest_updated_at
+      FROM session_notifications
+      WHERE user_id = ?
+      GROUP BY session_id
+      ORDER BY latest_updated_at DESC
+    `).all(userId);
+
+    return rows
+      .map((row) => row.session_id)
+      .filter((sessionId) => typeof sessionId === 'string' && sessionId.trim().length > 0);
+  },
+
+  setUnreadCompletedSession: (userId, sessionId, provider) => {
+    const normalizedProvider = normalizeSessionNotificationProvider(provider);
+    if (!userId || !sessionId || !normalizedProvider) {
+      return false;
+    }
+
+    db.prepare(`
+      INSERT INTO session_notifications (user_id, session_id, provider)
+      VALUES (?, ?, ?)
+      ON CONFLICT(user_id, session_id, provider)
+      DO UPDATE SET updated_at = CURRENT_TIMESTAMP
+    `).run(userId, sessionId, normalizedProvider);
+
+    return true;
+  },
+
+  markCompletedSessionAsRead: (userId, sessionId, provider = null) => {
+    if (!userId || !sessionId) {
+      return false;
+    }
+
+    const normalizedProvider = normalizeSessionNotificationProvider(provider);
+    const result = normalizedProvider
+      ? db.prepare(`
+          DELETE FROM session_notifications
+          WHERE user_id = ? AND session_id = ? AND provider = ?
+        `).run(userId, sessionId, normalizedProvider)
+      : db.prepare(`
+          DELETE FROM session_notifications
+          WHERE user_id = ? AND session_id = ?
+        `).run(userId, sessionId);
+
+    return result.changes > 0;
+  },
+
+  markCompletedSessionsAsRead: (userId, sessionIds, provider = null) => {
+    if (!userId || !Array.isArray(sessionIds)) {
+      return 0;
+    }
+
+    const normalizedSessionIds = sessionIds.filter(
+      (sessionId) => typeof sessionId === 'string' && sessionId.trim().length > 0
+    );
+    if (!normalizedSessionIds.length) {
+      return 0;
+    }
+
+    const normalizedProvider = normalizeSessionNotificationProvider(provider);
+    const placeholders = normalizedSessionIds.map(() => '?').join(',');
+    const result = normalizedProvider
+      ? db.prepare(`
+          DELETE FROM session_notifications
+          WHERE user_id = ? AND provider = ? AND session_id IN (${placeholders})
+        `).run(userId, normalizedProvider, ...normalizedSessionIds)
+      : db.prepare(`
+          DELETE FROM session_notifications
+          WHERE user_id = ? AND session_id IN (${placeholders})
+        `).run(userId, ...normalizedSessionIds);
+
+    return result.changes;
+  },
+};
+
 // Apply custom session names from the database (overrides CLI-generated summaries)
 function applyCustomSessionNames(sessions, provider) {
   if (!sessions?.length) return;
@@ -895,6 +1001,7 @@ export {
   trustedDevicesDb,
   sessionNamesDb,
   sessionAutoTitlesDb,
+  sessionNotificationsDb,
   applyPersistedSessionTitles,
   applyCustomSessionNames,
   appConfigDb,

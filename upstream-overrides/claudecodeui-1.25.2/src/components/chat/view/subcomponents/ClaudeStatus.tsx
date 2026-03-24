@@ -9,6 +9,8 @@ type ClaudeStatusProps = {
     tokens?: number;
     can_interrupt?: boolean;
   } | null;
+  startedAt?: number | null;
+  queuedCount?: number;
   onAbort?: () => void;
   isLoading: boolean;
   provider?: string;
@@ -36,6 +38,14 @@ function formatElapsedTime(totalSeconds: number, t: (key: string, options?: Reco
   });
 }
 
+function formatClockTime(timestamp: number) {
+  return new Date(timestamp).toLocaleTimeString([], {
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+  });
+}
+
 /**
  * 渲染会话回答中的状态条，并在可中断时提供停止按钮。
  *
@@ -48,6 +58,8 @@ function formatElapsedTime(totalSeconds: number, t: (key: string, options?: Reco
  */
 export default function ClaudeStatus({
   status,
+  startedAt = null,
+  queuedCount = 0,
   onAbort,
   isLoading,
   provider = 'claude',
@@ -61,15 +73,23 @@ export default function ClaudeStatus({
       return;
     }
 
-    const startTime = Date.now();
+    if (typeof startedAt !== 'number' || !Number.isFinite(startedAt)) {
+      setElapsedTime(0);
+      return;
+    }
 
-    const timer = window.setInterval(() => {
-      const elapsed = Math.floor((Date.now() - startTime) / 1000);
+    const syncElapsedTime = () => {
+      const elapsed = Math.max(0, Math.floor((Date.now() - startedAt) / 1000));
       setElapsedTime(elapsed);
+    };
+
+    syncElapsedTime();
+    const timer = window.setInterval(() => {
+      syncElapsedTime();
     }, 1000);
 
     return () => window.clearInterval(timer);
-  }, [isLoading]);
+  }, [isLoading, startedAt]);
 
   // Note: showThinking only controls the reasoning accordion in messages, not this processing indicator
   if (!isLoading && !status) {
@@ -79,11 +99,25 @@ export default function ClaudeStatus({
   const statusText = status?.text || t('claudeStatus.actions.processing', { defaultValue: 'Processing' });
   const cleanStatusText = statusText.replace(/[.]+$/, '');
   const canInterrupt = isLoading && status?.can_interrupt !== false;
+  const hasQueuedFollowUps = provider === 'codex' && queuedCount > 0;
   const providerLabelKey = PROVIDER_LABEL_KEYS[provider];
   const providerLabel = providerLabelKey
     ? t(providerLabelKey)
     : t('claudeStatus.providers.assistant', { defaultValue: 'Assistant' });
+  const startedAtLabel =
+    typeof startedAt === 'number' && Number.isFinite(startedAt)
+      ? formatClockTime(startedAt)
+      : null;
   const elapsedLabel = elapsedTime > 0 ? formatElapsedTime(elapsedTime, t) : '0s';
+  const queueSummaryText =
+    queuedCount === 1
+      ? t('claudeStatus.queue.singlePending', {
+          defaultValue: '1 条待发送，当前回答结束后自动发送',
+        })
+      : t('claudeStatus.queue.multiPending', {
+          count: queuedCount,
+          defaultValue: '{{count}} 条待发送，按顺序自动发送',
+        });
 
   return (
     <div className="animate-in slide-in-from-bottom mb-2 w-full duration-300 sm:mb-4">
@@ -135,13 +169,41 @@ export default function ClaudeStatus({
                 </p>
 
                 <div className="mt-1 flex min-h-[1.5rem] items-center gap-1 text-[10px] text-muted-foreground sm:gap-1.5 sm:text-xs">
+                  {startedAtLabel && (
+                    <span
+                      aria-hidden="true"
+                      className="inline-flex items-center justify-center rounded-full border border-border/70 bg-background/60 px-1.5 py-0.5 font-mono tabular-nums whitespace-nowrap sm:-ml-2 sm:px-2"
+                    >
+                      {t('claudeStatus.meta.sentAt', {
+                        time: startedAtLabel,
+                        defaultValue: '发送于 {{time}}',
+                      })}
+                    </span>
+                  )}
                   <span
                     aria-hidden="true"
-                    className="inline-flex min-w-[3.75rem] items-center justify-center rounded-full border border-border/70 bg-background/60 px-1.5 py-0.5 font-mono tabular-nums whitespace-nowrap sm:-ml-2 sm:min-w-[4.5rem] sm:px-2"
+                    className="inline-flex items-center justify-center rounded-full border border-border/70 bg-background/60 px-1.5 py-0.5 font-mono tabular-nums whitespace-nowrap sm:px-2"
                   >
-                    {elapsedLabel}
+                    {t('claudeStatus.meta.elapsed', {
+                      time: elapsedLabel,
+                      defaultValue: '已耗时 {{time}}',
+                    })}
                   </span>
+                  {hasQueuedFollowUps && (
+                    <span className="inline-flex items-center rounded-full border border-amber-500/30 bg-amber-500/10 px-1.5 py-0.5 font-medium text-amber-600 dark:text-amber-400 sm:px-2">
+                      {t('claudeStatus.queue.pending', {
+                        count: queuedCount,
+                        defaultValue: 'Queued: {{count}}',
+                      })}
+                    </span>
+                  )}
                 </div>
+
+                {hasQueuedFollowUps && (
+                  <p className="mt-1 text-[10px] text-amber-700/90 dark:text-amber-300/90 sm:text-xs">
+                    {queueSummaryText}
+                  </p>
+                )}
               </div>
             </div>
 

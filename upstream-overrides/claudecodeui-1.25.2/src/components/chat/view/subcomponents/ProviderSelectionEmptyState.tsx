@@ -149,9 +149,10 @@ export default function ProviderSelectionEmptyState({
     codexModel,
     geminiModel,
   );
+  const isOnSessionTemplatePage = !selectedSession && !currentSessionId;
 
-  /* ── New session — provider picker ── */
-  if (!selectedSession && !currentSessionId) {
+  /* ── Session template page — provider picker ── */
+  if (isOnSessionTemplatePage) {
     if (IS_CODEX_ONLY_HARDENED) {
       return (
         <div className="flex h-full items-center justify-center px-4">

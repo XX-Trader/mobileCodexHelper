@@ -33,7 +33,6 @@ export const CODEX_REASONING_EFFORTS = {
     { value: 'high', label: 'High' },
     { value: 'medium', label: 'Medium' },
     { value: 'low', label: 'Low' },
-    { value: 'minimal', label: 'Minimal' },
   ],
   DEFAULT: 'xhigh',
 } as const;

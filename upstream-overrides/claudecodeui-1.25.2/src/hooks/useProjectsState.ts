@@ -2,14 +2,21 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { NavigateFunction } from 'react-router-dom';
 import { api } from '../utils/api';
 import { IS_CODEX_ONLY_HARDENED } from '../constants/config';
+import {
+  createDefaultSessionViewState,
+  createSessionTemplateViewTarget,
+  useSessionViewState,
+} from './useSessionViewState';
+import type { SessionDeleteConfirmation } from '../components/sidebar/types/types';
 import type {
   AppSocketMessage,
-  AppTab,
   LoadingProgress,
   Project,
   ProjectSession,
   ProjectsUpdatedMessage,
+  SessionProvider,
 } from '../types/app';
+import type { SessionViewChatRuntime } from '../types/sessionView';
 
 type UseProjectsStateArgs = {
   sessionId?: string;
@@ -25,8 +32,35 @@ type FetchProjectsOptions = {
 
 const RECENT_SESSION_STORAGE_KEY = 'recentSessionIds';
 const MAX_RECENT_SESSIONS = 6;
+const TEMPORARY_SESSION_PREFIX = 'new-session-';
 
 const serialize = (value: unknown) => JSON.stringify(value ?? null);
+
+const readResponseErrorMessage = async (response: Response, fallbackMessage: string): Promise<string> => {
+  try {
+    const responseText = await response.text();
+    if (!responseText.trim()) {
+      return fallbackMessage;
+    }
+
+    try {
+      const parsedError = JSON.parse(responseText) as { error?: string; details?: string };
+      return parsedError.error || parsedError.details || fallbackMessage;
+    } catch {
+      return responseText;
+    }
+  } catch {
+    return fallbackMessage;
+  }
+};
+
+const resolveSessionDeleteProvider = (provider?: SessionProvider): SessionProvider =>
+  provider || (IS_CODEX_ONLY_HARDENED ? 'codex' : 'claude');
+
+type SessionDeleteResult = {
+  success: boolean;
+  error: string | null;
+};
 
 const projectsHaveChanges = (
   prevProjects: Project[],
@@ -47,6 +81,7 @@ const projectsHaveChanges = (
       nextProject.name !== prevProject.name ||
       nextProject.displayName !== prevProject.displayName ||
       nextProject.fullPath !== prevProject.fullPath ||
+      Boolean(nextProject.isHidden) !== Boolean(prevProject.isHidden) ||
       serialize(nextProject.sessionMeta) !== serialize(prevProject.sessionMeta) ||
       serialize(nextProject.sessions) !== serialize(prevProject.sessions) ||
       serialize(nextProject.taskmaster) !== serialize(prevProject.taskmaster);
@@ -109,60 +144,92 @@ const findProjectSessionById = (
   return null;
 };
 
-const isUpdateAdditive = (
-  currentProjects: Project[],
-  updatedProjects: Project[],
-  selectedProject: Project | null,
+const isTemporarySessionId = (sessionId?: string | null) =>
+  Boolean(sessionId && sessionId.startsWith(TEMPORARY_SESSION_PREFIX));
+
+const hasInFlightSessionSelection = (
   selectedSession: ProjectSession | null,
+  activeSessions: Set<string>,
+  routeSessionId?: string,
 ): boolean => {
-  if (!selectedProject || !selectedSession) {
+  if (selectedSession?.id && activeSessions.has(selectedSession.id)) {
     return true;
   }
 
-  const currentSelectedProject = currentProjects.find((project) => project.name === selectedProject.name);
-  const updatedSelectedProject = updatedProjects.find((project) => project.name === selectedProject.name);
-
-  if (!currentSelectedProject || !updatedSelectedProject) {
-    return false;
+  if (
+    routeSessionId &&
+    selectedSession?.id &&
+    routeSessionId !== selectedSession.id &&
+    (isTemporarySessionId(routeSessionId) || isTemporarySessionId(selectedSession.id))
+  ) {
+    return true;
   }
 
-  const currentSelectedSession = getProjectSessions(currentSelectedProject).find(
-    (session) => session.id === selectedSession.id,
-  );
-  const updatedSelectedSession = getProjectSessions(updatedSelectedProject).find(
-    (session) => session.id === selectedSession.id,
-  );
-
-  if (!currentSelectedSession || !updatedSelectedSession) {
-    return false;
-  }
-
-  return (
-    currentSelectedSession.id === updatedSelectedSession.id &&
-    currentSelectedSession.title === updatedSelectedSession.title &&
-    currentSelectedSession.created_at === updatedSelectedSession.created_at &&
-    currentSelectedSession.updated_at === updatedSelectedSession.updated_at
-  );
+  return Array.from(activeSessions).some((sessionId) => sessionId.startsWith(TEMPORARY_SESSION_PREFIX));
 };
 
-const VALID_TABS: Set<string> = IS_CODEX_ONLY_HARDENED
-  ? new Set(['chat'])
-  : new Set(['chat', 'files', 'shell', 'git', 'tasks', 'preview']);
+const mergeTemporaryCodexSessions = (currentProjects: Project[], updatedProjects: Project[]): Project[] => {
+  return updatedProjects.map((project) => {
+    const currentProject = currentProjects.find((existingProject) => existingProject.name === project.name);
+    const temporaryCodexSessions =
+      currentProject?.codexSessions?.filter((session) => isTemporarySessionId(session.id)) ?? [];
 
-const isValidTab = (tab: string): tab is AppTab => {
-  return VALID_TABS.has(tab) || tab.startsWith('plugin:');
-};
-
-const readPersistedTab = (): AppTab => {
-  try {
-    const stored = localStorage.getItem('activeTab');
-    if (stored && isValidTab(stored)) {
-      return stored as AppTab;
+    if (temporaryCodexSessions.length === 0) {
+      return project;
     }
-  } catch {
-    // localStorage unavailable
+
+    const nextCodexSessions = [...temporaryCodexSessions];
+    for (const session of project.codexSessions ?? []) {
+      if (!nextCodexSessions.some((temporarySession) => temporarySession.id === session.id)) {
+        nextCodexSessions.push(session);
+      }
+    }
+
+    return {
+      ...project,
+      codexSessions: nextCodexSessions,
+    };
+  });
+};
+
+const upsertCodexSession = (project: Project, session: ProjectSession): Project => {
+  const existingSessions = project.codexSessions ?? [];
+  const dedupedSessions = existingSessions.filter((existingSession) => existingSession.id !== session.id);
+
+  return {
+    ...project,
+    codexSessions: [session, ...dedupedSessions],
+  };
+};
+
+const replaceCodexSessionId = (
+  project: Project,
+  temporarySessionId: string,
+  realSessionId: string,
+): Project => {
+  const existingSessions = project.codexSessions ?? [];
+  const nextSessions = existingSessions.map((session) =>
+    session.id === temporarySessionId
+      ? {
+          ...session,
+          id: realSessionId,
+          __provider: 'codex' as const,
+          updated_at: new Date().toISOString(),
+        }
+      : session,
+  );
+
+  const dedupedSessions: ProjectSession[] = [];
+  for (const session of nextSessions) {
+    if (!dedupedSessions.some((existingSession) => existingSession.id === session.id)) {
+      dedupedSessions.push(session);
+    }
   }
-  return 'chat';
+
+  return {
+    ...project,
+    codexSessions: dedupedSessions,
+  };
 };
 
 const readRecentSessionIds = (): string[] => {
@@ -193,16 +260,41 @@ export function useProjectsState({
   const [projects, setProjects] = useState<Project[]>([]);
   const [selectedProject, setSelectedProject] = useState<Project | null>(null);
   const [selectedSession, setSelectedSession] = useState<ProjectSession | null>(null);
-  const [activeTab, setActiveTab] = useState<AppTab>(readPersistedTab);
   const [recentSessionIds, setRecentSessionIds] = useState<string[]>(readRecentSessionIds);
+  const projectsRef = useRef<Project[]>([]);
+  const selectedProjectRef = useRef<Project | null>(null);
+  const selectedSessionRef = useRef<ProjectSession | null>(null);
+  const lastTemplateRouteResetKeyRef = useRef<string | null>(null);
 
   useEffect(() => {
-    try {
-      localStorage.setItem('activeTab', activeTab);
-    } catch {
-      // Silently ignore storage errors
-    }
-  }, [activeTab]);
+    projectsRef.current = projects;
+  }, [projects]);
+
+  useEffect(() => {
+    selectedProjectRef.current = selectedProject;
+  }, [selectedProject]);
+
+  useEffect(() => {
+    selectedSessionRef.current = selectedSession;
+  }, [selectedSession]);
+
+  const {
+    activeTab,
+    mountedTabs,
+    currentChatRuntime,
+    getViewStateForTarget,
+    getChatRuntimeForTarget,
+    setActiveTab,
+    updateCurrentChatRuntime,
+    updateChatRuntimeForTarget,
+    upsertViewStateForTarget,
+    replaceViewStateForTarget,
+    removeViewStateForTarget,
+    removeViewStatesForProject,
+  } = useSessionViewState({
+    selectedProject,
+    selectedSession,
+  });
 
   useEffect(() => {
     try {
@@ -219,6 +311,8 @@ export function useProjectsState({
   const [showSettings, setShowSettings] = useState(false);
   const [settingsInitialTab, setSettingsInitialTab] = useState('agents');
   const [externalMessageUpdate, setExternalMessageUpdate] = useState(0);
+  const [sessionDeleteConfirmation, setSessionDeleteConfirmation] = useState<SessionDeleteConfirmation | null>(null);
+  const [isDeletingSession, setIsDeletingSession] = useState(false);
 
   const loadingProgressTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -242,6 +336,50 @@ export function useProjectsState({
     );
   }, []);
 
+  const requestSessionDelete = useCallback(
+    (
+      projectName: string,
+      sessionId: string,
+      sessionTitle: string,
+      provider: SessionProvider,
+    ) => {
+      setSessionDeleteConfirmation({
+        projectName,
+        sessionId,
+        sessionTitle,
+        provider: resolveSessionDeleteProvider(provider),
+      });
+    },
+    [],
+  );
+
+  const cancelSessionDelete = useCallback(() => {
+    if (isDeletingSession) {
+      return;
+    }
+
+    setSessionDeleteConfirmation(null);
+  }, [isDeletingSession]);
+
+  const resetSessionTemplateViewState = useCallback(
+    (projectName: string) => {
+      upsertViewStateForTarget(
+        createSessionTemplateViewTarget(projectName),
+        createDefaultSessionViewState('chat'),
+      );
+    },
+    [upsertViewStateForTarget],
+  );
+
+  const clearSessionTemplatePendingMarkers = useCallback(() => {
+    if (typeof window === 'undefined') {
+      return;
+    }
+
+    sessionStorage.removeItem('pendingSessionId');
+    sessionStorage.removeItem('cursorSessionId');
+  }, []);
+
   const fetchProjects = useCallback(async ({ showLoadingState = true }: FetchProjectsOptions = {}) => {
     try {
       if (showLoadingState) {
@@ -251,12 +389,14 @@ export function useProjectsState({
       const projectData = (await response.json()) as Project[];
 
       setProjects((prevProjects) => {
+        const mergedProjects = mergeTemporaryCodexSessions(prevProjects, projectData);
+
         if (prevProjects.length === 0) {
-          return projectData;
+          return mergedProjects;
         }
 
-      return projectsHaveChanges(prevProjects, projectData, !IS_CODEX_ONLY_HARDENED)
-          ? projectData
+        return projectsHaveChanges(prevProjects, mergedProjects, !IS_CODEX_ONLY_HARDENED)
+          ? mergedProjects
           : prevProjects;
       });
     } catch (error) {
@@ -289,6 +429,41 @@ export function useProjectsState({
     }
   }, [isLoadingProjects, projects, selectedProject, sessionId]);
 
+  // The root route is the session template page, so it must not keep a stale real session bound.
+  useEffect(() => {
+    const hasConcreteSessionRoute =
+      typeof window !== 'undefined' && /\/session\/[^/]+/.test(window.location.pathname);
+
+    if (sessionId || hasConcreteSessionRoute) {
+      lastTemplateRouteResetKeyRef.current = null;
+      return;
+    }
+
+    if (selectedSession?.id) {
+      setSelectedSession(null);
+      return;
+    }
+
+    if (!selectedProject?.name) {
+      return;
+    }
+
+    const templateRouteResetKey = selectedProject.name;
+    if (lastTemplateRouteResetKeyRef.current === templateRouteResetKey) {
+      return;
+    }
+
+    lastTemplateRouteResetKeyRef.current = templateRouteResetKey;
+    clearSessionTemplatePendingMarkers();
+    resetSessionTemplateViewState(selectedProject.name);
+  }, [
+    clearSessionTemplatePendingMarkers,
+    resetSessionTemplateViewState,
+    selectedProject?.name,
+    selectedSession?.id,
+    sessionId,
+  ]);
+
   useEffect(() => {
     if (!latestMessage) {
       return;
@@ -317,8 +492,11 @@ export function useProjectsState({
     }
 
     const projectsMessage = latestMessage as ProjectsUpdatedMessage;
+    const currentProjects = projectsRef.current;
+    const currentSelectedProject = selectedProjectRef.current;
+    const currentSelectedSession = selectedSessionRef.current;
 
-    if (projectsMessage.changedFile && selectedSession && selectedProject) {
+    if (projectsMessage.changedFile && currentSelectedSession && currentSelectedProject) {
       const normalized = projectsMessage.changedFile.replace(/\\/g, '/');
       const changedFileParts = normalized.split('/');
 
@@ -326,8 +504,8 @@ export function useProjectsState({
         const filename = changedFileParts[changedFileParts.length - 1];
         const changedSessionId = filename.replace('.jsonl', '');
 
-        if (changedSessionId === selectedSession.id) {
-          const isSessionActive = activeSessions.has(selectedSession.id);
+        if (changedSessionId === currentSelectedSession.id) {
+          const isSessionActive = activeSessions.has(currentSelectedSession.id);
 
           if (!isSessionActive) {
             setExternalMessageUpdate((prev) => prev + 1);
@@ -336,58 +514,62 @@ export function useProjectsState({
       }
     }
 
-    const hasActiveSession =
-      (selectedSession && activeSessions.has(selectedSession.id)) ||
-      (activeSessions.size > 0 && Array.from(activeSessions).some((id) => id.startsWith('new-session-')));
-
-    const updatedProjects = projectsMessage.projects;
-
+    const updatedProjects = mergeTemporaryCodexSessions(currentProjects, projectsMessage.projects);
     setProjects(updatedProjects);
-    const shouldPreserveSelectedSessionSelection =
-      hasActiveSession &&
-      !isUpdateAdditive(projects, updatedProjects, selectedProject, selectedSession);
+    const shouldFreezeSelectedBinding = hasInFlightSessionSelection(
+      currentSelectedSession,
+      activeSessions,
+      sessionId,
+    );
 
-    if (!selectedProject) {
+    if (!currentSelectedProject) {
       return;
     }
 
     const updatedSelectedProject = updatedProjects.find(
-      (project) => project.name === selectedProject.name,
+      (project) => project.name === currentSelectedProject.name,
     );
 
     if (!updatedSelectedProject) {
       return;
     }
 
-    if (serialize(updatedSelectedProject) !== serialize(selectedProject)) {
+    if (
+      !shouldFreezeSelectedBinding &&
+      serialize(updatedSelectedProject) !== serialize(currentSelectedProject)
+    ) {
       setSelectedProject(updatedSelectedProject);
     }
 
-    if (!selectedSession) {
+    if (!currentSelectedSession) {
       return;
     }
 
     const updatedSelectedSession = getProjectSessions(updatedSelectedProject).find(
-      (session) => session.id === selectedSession.id,
+      (session) => session.id === currentSelectedSession.id,
     );
+    const shouldPreserveRouteSelection =
+      Boolean(sessionId) && currentSelectedSession.id === sessionId;
 
     if (!updatedSelectedSession) {
-      setSelectedSession(null);
+      if (!shouldFreezeSelectedBinding && !shouldPreserveRouteSelection) {
+        setSelectedSession(null);
+      }
       return;
     }
 
     const normalizedUpdatedSelectedSession =
-      updatedSelectedSession.__provider || !selectedSession.__provider
+      updatedSelectedSession.__provider || !currentSelectedSession.__provider
         ? updatedSelectedSession
-        : { ...updatedSelectedSession, __provider: selectedSession.__provider };
+        : { ...updatedSelectedSession, __provider: currentSelectedSession.__provider };
 
     if (
-      !shouldPreserveSelectedSessionSelection &&
-      serialize(normalizedUpdatedSelectedSession) !== serialize(selectedSession)
+      !shouldFreezeSelectedBinding &&
+      serialize(normalizedUpdatedSelectedSession) !== serialize(currentSelectedSession)
     ) {
       setSelectedSession(normalizedUpdatedSelectedSession);
     }
-  }, [latestMessage, selectedProject, selectedSession, activeSessions, projects]);
+  }, [latestMessage, activeSessions]);
 
   useEffect(() => {
     return () => {
@@ -476,27 +658,32 @@ export function useProjectsState({
     }
   }, [recordRecentSession, selectedSession?.id]);
 
-  const handleProjectSelect = useCallback(
+  const openProjectTemplatePage = useCallback(
     (project: Project) => {
       setSelectedProject(project);
       setSelectedSession(null);
+      clearSessionTemplatePendingMarkers();
+      resetSessionTemplateViewState(project.name);
       navigate('/');
 
       if (isMobile) {
         setSidebarOpen(false);
       }
     },
-    [isMobile, navigate],
+    [clearSessionTemplatePendingMarkers, isMobile, navigate, resetSessionTemplateViewState],
+  );
+
+  const handleProjectSelect = useCallback(
+    (project: Project) => {
+      openProjectTemplatePage(project);
+    },
+    [openProjectTemplatePage],
   );
 
   const handleSessionSelect = useCallback(
     (session: ProjectSession) => {
       setSelectedSession(session);
       recordRecentSession(session.id);
-
-      if (activeTab === 'tasks' || activeTab === 'preview') {
-        setActiveTab('chat');
-      }
 
       if (!IS_CODEX_ONLY_HARDENED && session.__provider === 'cursor') {
         sessionStorage.setItem('cursorSessionId', session.id);
@@ -513,28 +700,189 @@ export function useProjectsState({
 
       navigate(`/session/${session.id}`);
     },
-    [activeTab, isMobile, navigate, recordRecentSession, selectedProject?.name],
+    [isMobile, navigate, recordRecentSession, selectedProject?.name],
   );
 
   const handleNewSession = useCallback(
     (project: Project) => {
+      openProjectTemplatePage(project);
+    },
+    [openProjectTemplatePage],
+  );
+
+  const createOptimisticSession = useCallback(
+    (
+      project: Project,
+      session: ProjectSession,
+      initialChatRuntime?: Partial<SessionViewChatRuntime>,
+    ) => {
+      const templateViewState = getViewStateForTarget(createSessionTemplateViewTarget(project.name));
+      const templateChatRuntime = getChatRuntimeForTarget(createSessionTemplateViewTarget(project.name));
+      const optimisticSession = {
+        ...session,
+        __provider: 'codex' as const,
+        __projectName: project.name,
+      };
+
+      setProjects((prevProjects) =>
+        prevProjects.map((existingProject) =>
+          existingProject.name === project.name
+            ? upsertCodexSession(existingProject, optimisticSession)
+            : existingProject,
+        ),
+      );
+      upsertViewStateForTarget(
+        {
+          projectName: project.name,
+          sessionId: optimisticSession.id,
+          provider: optimisticSession.__provider || 'codex',
+        },
+        {
+          activeTab: templateViewState.activeTab,
+          mountedTabs: templateViewState.mountedTabs,
+          lastVisitedAt: Date.now(),
+          chatRuntime: {
+            ...templateChatRuntime,
+            ...initialChatRuntime,
+            updatedAt: Date.now(),
+          },
+        },
+      );
       setSelectedProject(project);
-      setSelectedSession(null);
-      setActiveTab('chat');
-      navigate('/');
+      setSelectedSession(optimisticSession);
+      navigate(`/session/${optimisticSession.id}`);
 
       if (isMobile) {
         setSidebarOpen(false);
       }
     },
-    [isMobile, navigate],
+    [getChatRuntimeForTarget, getViewStateForTarget, isMobile, navigate, upsertViewStateForTarget],
+  );
+
+  const replaceOptimisticSession = useCallback(
+    (temporarySessionId: string | null | undefined, realSessionId: string) => {
+      if (!realSessionId) {
+        return;
+      }
+
+      if (!temporarySessionId || !isTemporarySessionId(temporarySessionId)) {
+        setSelectedSession((previousSession) =>
+          previousSession
+            ? {
+                ...previousSession,
+                id: realSessionId,
+                __provider: 'codex',
+              }
+            : previousSession,
+        );
+        navigate(`/session/${realSessionId}`);
+        return;
+      }
+
+      const projectName =
+        selectedSessionRef.current?.__projectName ||
+        selectedProjectRef.current?.name ||
+        projectsRef.current.find((project) =>
+          (project.codexSessions ?? []).some((session) => session.id === temporarySessionId),
+        )?.name ||
+        null;
+
+      if (projectName) {
+        replaceViewStateForTarget(
+          {
+            projectName,
+            sessionId: temporarySessionId,
+            provider: 'codex',
+          },
+          {
+            projectName,
+            sessionId: realSessionId,
+            provider: 'codex',
+          },
+        );
+      }
+
+      setRecentSessionIds((previous) => {
+        const nextSessionIds = previous.map((sessionId) =>
+          sessionId === temporarySessionId ? realSessionId : sessionId,
+        );
+        if (!nextSessionIds.includes(realSessionId)) {
+          nextSessionIds.push(realSessionId);
+        }
+        return Array.from(new Set(nextSessionIds)).slice(-MAX_RECENT_SESSIONS);
+      });
+
+      setProjects((prevProjects) =>
+        prevProjects.map((project) => {
+          if (!(project.codexSessions ?? []).some((session) => session.id === temporarySessionId)) {
+            return project;
+          }
+
+          return replaceCodexSessionId(project, temporarySessionId, realSessionId);
+        }),
+      );
+
+      setSelectedSession((previousSession) =>
+        previousSession?.id === temporarySessionId
+          ? {
+              ...previousSession,
+              id: realSessionId,
+              __provider: 'codex',
+            }
+          : previousSession,
+      );
+
+      navigate(`/session/${realSessionId}`);
+    },
+    [navigate, replaceViewStateForTarget],
   );
 
   const handleSessionDelete = useCallback(
     (sessionIdToDelete: string) => {
-      if (selectedSession?.id === sessionIdToDelete) {
+      const currentSelectedSessionId = selectedSessionRef.current?.id || null;
+      const matchedProjectName =
+        currentSelectedSessionId === sessionIdToDelete
+          ? selectedProjectRef.current?.name || null
+          : projectsRef.current.find((project) =>
+              getProjectSessions(project).some((session) => session.id === sessionIdToDelete),
+            )?.name || null;
+
+      if (typeof window !== 'undefined') {
+        if (sessionStorage.getItem('pendingSessionId') === sessionIdToDelete) {
+          sessionStorage.removeItem('pendingSessionId');
+        }
+
+        if (sessionStorage.getItem('cursorSessionId') === sessionIdToDelete) {
+          sessionStorage.removeItem('cursorSessionId');
+        }
+      }
+
+      if (currentSelectedSessionId === sessionIdToDelete) {
         setSelectedSession(null);
         navigate('/');
+      }
+
+      if (matchedProjectName) {
+        removeViewStateForTarget({
+          projectName: matchedProjectName,
+          sessionId: sessionIdToDelete,
+          provider: 'codex',
+        });
+        removeViewStateForTarget({
+          projectName: matchedProjectName,
+          sessionId: sessionIdToDelete,
+          provider: 'claude',
+        });
+        removeViewStateForTarget({
+          projectName: matchedProjectName,
+          sessionId: sessionIdToDelete,
+          provider: 'cursor',
+        });
+        removeViewStateForTarget({
+          projectName: matchedProjectName,
+          sessionId: sessionIdToDelete,
+          provider: 'gemini',
+        });
       }
 
       dismissRecentSession(sessionIdToDelete);
@@ -553,54 +901,126 @@ export function useProjectsState({
         })),
       );
     },
-    [dismissRecentSession, navigate, selectedSession?.id],
+    [dismissRecentSession, navigate, removeViewStateForTarget],
   );
+
+  const confirmSessionDelete = useCallback(async (): Promise<SessionDeleteResult> => {
+    if (!sessionDeleteConfirmation || isDeletingSession) {
+      return { success: false, error: null };
+    }
+
+    const { projectName, sessionId, provider } = sessionDeleteConfirmation;
+    setIsDeletingSession(true);
+
+    try {
+      let response: Response;
+
+      if (provider === 'codex') {
+        response = await api.deleteCodexSession(sessionId);
+      } else if (provider === 'gemini') {
+        response = await api.deleteGeminiSession(sessionId);
+      } else {
+        response = await api.deleteSession(projectName, sessionId);
+      }
+
+      if (!response.ok) {
+        const errorText = await readResponseErrorMessage(response, 'Failed to delete session. Please try again.');
+        console.error('[ProjectsState] Failed to delete session:', {
+          projectName,
+          sessionId,
+          provider,
+          status: response.status,
+          error: errorText,
+        });
+        return { success: false, error: errorText };
+      }
+
+      setSessionDeleteConfirmation(null);
+      handleSessionDelete(sessionId);
+      return { success: true, error: null };
+    } catch (error) {
+      console.error('[ProjectsState] Error deleting session:', {
+        projectName,
+        sessionId,
+        provider,
+        error,
+      });
+
+      return {
+        success: false,
+        error: error instanceof Error ? error.message : 'Error deleting session. Please try again.',
+      };
+    } finally {
+      setIsDeletingSession(false);
+    }
+  }, [handleSessionDelete, isDeletingSession, sessionDeleteConfirmation]);
+
+  const confirmSessionDeleteWithFeedback = useCallback(async () => {
+    const result = await confirmSessionDelete();
+    if (result.error && typeof window !== 'undefined') {
+      window.alert(result.error);
+    }
+  }, [confirmSessionDelete]);
 
   const handleSidebarRefresh = useCallback(async () => {
     try {
       const response = await api.projects();
       const freshProjects = (await response.json()) as Project[];
-
-      setProjects((prevProjects) =>
-        projectsHaveChanges(prevProjects, freshProjects, !IS_CODEX_ONLY_HARDENED) ? freshProjects : prevProjects,
+      const mergedProjects = mergeTemporaryCodexSessions(projectsRef.current, freshProjects);
+      const currentSelectedProject = selectedProjectRef.current;
+      const currentSelectedSession = selectedSessionRef.current;
+      const shouldFreezeSelectedBinding = hasInFlightSessionSelection(
+        currentSelectedSession,
+        activeSessions,
+        sessionId,
       );
 
-      if (!selectedProject) {
+      setProjects((prevProjects) =>
+        projectsHaveChanges(prevProjects, mergedProjects, !IS_CODEX_ONLY_HARDENED) ? mergedProjects : prevProjects,
+      );
+
+      if (!currentSelectedProject) {
         return;
       }
 
-      const refreshedProject = freshProjects.find((project) => project.name === selectedProject.name);
+      const refreshedProject = mergedProjects.find((project) => project.name === currentSelectedProject.name);
       if (!refreshedProject) {
         return;
       }
 
-      if (serialize(refreshedProject) !== serialize(selectedProject)) {
+      if (
+        !shouldFreezeSelectedBinding &&
+        serialize(refreshedProject) !== serialize(currentSelectedProject)
+      ) {
         setSelectedProject(refreshedProject);
       }
 
-      if (!selectedSession) {
+      if (!currentSelectedSession) {
         return;
       }
 
       const refreshedSession = getProjectSessions(refreshedProject).find(
-        (session) => session.id === selectedSession.id,
+        (session) => session.id === currentSelectedSession.id,
       );
 
       if (refreshedSession) {
         // Keep provider metadata stable when refreshed payload doesn't include __provider.
         const normalizedRefreshedSession =
-          refreshedSession.__provider || !selectedSession.__provider
+          refreshedSession.__provider || !currentSelectedSession.__provider
             ? refreshedSession
-            : { ...refreshedSession, __provider: selectedSession.__provider };
+            : { ...refreshedSession, __provider: currentSelectedSession.__provider };
 
-        if (serialize(normalizedRefreshedSession) !== serialize(selectedSession)) {
+        if (
+          !shouldFreezeSelectedBinding &&
+          serialize(normalizedRefreshedSession) !== serialize(currentSelectedSession)
+        ) {
           setSelectedSession(normalizedRefreshedSession);
         }
       }
     } catch (error) {
       console.error('Error refreshing sidebar:', error);
     }
-  }, [selectedProject, selectedSession]);
+  }, [activeSessions]);
 
   const handleProjectDelete = useCallback(
     (projectName: string) => {
@@ -610,9 +1030,10 @@ export function useProjectsState({
         navigate('/');
       }
 
+      removeViewStatesForProject(projectName);
       setProjects((prevProjects) => prevProjects.filter((project) => project.name !== projectName));
     },
-    [navigate, selectedProject?.name],
+    [navigate, removeViewStatesForProject, selectedProject?.name],
   );
 
   const handleProjectHide = useCallback(
@@ -623,9 +1044,10 @@ export function useProjectsState({
         navigate('/');
       }
 
+      removeViewStatesForProject(projectName);
       setProjects((prevProjects) => prevProjects.filter((project) => project.name !== projectName));
     },
-    [navigate, selectedProject?.name],
+    [navigate, removeViewStatesForProject, selectedProject?.name],
   );
 
   const sidebarSharedProps = useMemo(
@@ -636,7 +1058,7 @@ export function useProjectsState({
       onProjectSelect: handleProjectSelect,
       onSessionSelect: handleSessionSelect,
       onNewSession: handleNewSession,
-      onSessionDelete: handleSessionDelete,
+      onSessionDelete: requestSessionDelete,
       onProjectDelete: handleProjectDelete,
       onProjectHide: handleProjectHide,
       isLoading: isLoadingProjects,
@@ -646,21 +1068,29 @@ export function useProjectsState({
       showSettings,
       settingsInitialTab,
       onCloseSettings: () => setShowSettings(false),
+      sessionDeleteConfirmation,
+      isDeletingSession,
+      onCancelDeleteSession: cancelSessionDelete,
+      onConfirmDeleteSession: confirmSessionDeleteWithFeedback,
       isMobile,
     }),
     [
+      cancelSessionDelete,
+      confirmSessionDeleteWithFeedback,
       handleNewSession,
       handleProjectDelete,
       handleProjectHide,
       handleProjectSelect,
-      handleSessionDelete,
+      requestSessionDelete,
       handleSessionSelect,
       handleSidebarRefresh,
       isLoadingProjects,
       isMobile,
       loadingProgress,
       projects,
+      isDeletingSession,
       settingsInitialTab,
+      sessionDeleteConfirmation,
       selectedProject,
       selectedSession,
       showSettings,
@@ -699,6 +1129,10 @@ export function useProjectsState({
     selectedProject,
     selectedSession,
     activeTab,
+    mountedTabs,
+    currentChatRuntime,
+    getViewStateForTarget,
+    getChatRuntimeForTarget,
     sidebarOpen,
     isLoadingProjects,
     loadingProgress,
@@ -706,7 +1140,11 @@ export function useProjectsState({
     showSettings,
     settingsInitialTab,
     externalMessageUpdate,
+    sessionDeleteConfirmation,
+    isDeletingSession,
     setActiveTab,
+    updateCurrentChatRuntime,
+    updateChatRuntimeForTarget,
     setSidebarOpen,
     setIsInputFocused,
     setShowSettings,
@@ -717,7 +1155,12 @@ export function useProjectsState({
     handleProjectSelect,
     handleSessionSelect,
     handleNewSession,
+    createOptimisticSession,
+    replaceOptimisticSession,
     dismissRecentSession,
+    requestSessionDelete,
+    cancelSessionDelete,
+    confirmSessionDelete,
     handleSessionDelete,
     handleProjectDelete,
     handleProjectHide,

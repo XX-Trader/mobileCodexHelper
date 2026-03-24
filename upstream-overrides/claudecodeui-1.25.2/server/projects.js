@@ -67,8 +67,36 @@ import { open } from 'sqlite';
 import os from 'os';
 import sessionManager from './sessionManager.js';
 import { applyCustomSessionNames, applyPersistedSessionTitles } from './database/db.js';
+import { extractCodexContextTokenUsageFromInfo } from './utils/codexTokenUsage.js';
 
 const CODEX_ONLY_HARDENED_MODE = process.env.CODEX_ONLY_HARDENED_MODE !== 'false';
+const CODEX_HOME_DIR = path.join(os.homedir(), '.codex');
+const CODEX_STATE_DB_PATH = path.join(CODEX_HOME_DIR, 'state_5.sqlite');
+const CODEX_SESSIONS_DIR = path.join(CODEX_HOME_DIR, 'sessions');
+const CODEX_ARCHIVED_SESSIONS_DIR = path.join(CODEX_HOME_DIR, 'archived_sessions');
+
+const normalizeComparableFilePath = (targetPath) => {
+  if (!targetPath || typeof targetPath !== 'string') {
+    return '';
+  }
+
+  return path.resolve(targetPath).replace(/\\/g, '/').toLowerCase();
+};
+
+const isSameFilePath = (leftPath, rightPath) =>
+  normalizeComparableFilePath(leftPath) === normalizeComparableFilePath(rightPath);
+
+const normalizeCodexThreadTitle = (title) =>
+  typeof title === 'string' && title.trim().length > 0 ? title.trim() : '';
+
+async function pathExists(targetPath) {
+  try {
+    await fs.access(targetPath);
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 // Import TaskMaster detection functions
 async function detectTaskMasterFolder(projectPath) {
@@ -209,6 +237,7 @@ function toCodexOnlyProject(project) {
     path: project.path,
     displayName: project.displayName,
     fullPath: project.fullPath,
+    isHidden: Boolean(project.isHidden),
     isCustomName: Boolean(project.isCustomName),
     isManuallyAdded: Boolean(project.isManuallyAdded),
     sessions: [],
@@ -274,7 +303,8 @@ function mergeCodexProjectMetadata(existingMetadata, candidateMetadata) {
       ? candidateMetadata.displayName
       : existingMetadata.displayName || candidateMetadata?.displayName || '',
     isCustomName: existingHasCustomName || candidateHasCustomName,
-    isManuallyAdded: Boolean(existingMetadata.isManuallyAdded || candidateMetadata?.isManuallyAdded)
+    isManuallyAdded: Boolean(existingMetadata.isManuallyAdded || candidateMetadata?.isManuallyAdded),
+    isHidden: Boolean(existingMetadata.isHidden || candidateMetadata?.isHidden)
   };
 }
 
@@ -299,7 +329,8 @@ async function buildCodexProjectMetadataLookup(config) {
           name: entry.name,
           displayName: config[entry.name]?.displayName || '',
           isCustomName: Boolean(config[entry.name]?.displayName),
-          isManuallyAdded: Boolean(config[entry.name]?.manuallyAdded)
+          isManuallyAdded: Boolean(config[entry.name]?.manuallyAdded),
+          isHidden: Boolean(config[entry.name]?.hidden)
         })
       );
     }
@@ -322,7 +353,8 @@ async function buildCodexProjectMetadataLookup(config) {
         name: projectName,
         displayName: projectConfig.displayName || '',
         isCustomName: Boolean(projectConfig.displayName),
-        isManuallyAdded: Boolean(projectConfig.manuallyAdded)
+        isManuallyAdded: Boolean(projectConfig.manuallyAdded),
+        isHidden: Boolean(projectConfig.hidden)
       })
     );
   }
@@ -370,6 +402,7 @@ async function getCodexOnlyProjects(progressCallback, config, codexSessionsIndex
       path: actualProjectDir,
       displayName,
       fullPath: actualProjectDir,
+      isHidden: Boolean(matchedMetadata?.isHidden),
       isCustomName: Boolean(customName),
       isManuallyAdded: Boolean(matchedMetadata?.isManuallyAdded),
       sessions: [],
@@ -382,6 +415,33 @@ async function getCodexOnlyProjects(progressCallback, config, codexSessionsIndex
       },
       taskmaster: null
     });
+  }
+
+  const existingProjectNames = new Set(projects.map((project) => project.name));
+
+  for (const [projectName, projectConfig] of Object.entries(config)) {
+    if (!projectConfig?.manuallyAdded || existingProjectNames.has(projectName)) {
+      continue;
+    }
+
+    const actualProjectDir =
+      typeof projectConfig.originalPath === 'string' && projectConfig.originalPath.length > 0
+        ? projectConfig.originalPath
+        : await extractProjectDirectory(projectName);
+
+    const displayName =
+      projectConfig.displayName || await generateDisplayName(projectName, actualProjectDir);
+
+    projects.push(toCodexOnlyProject({
+      name: projectName,
+      path: actualProjectDir,
+      displayName,
+      fullPath: actualProjectDir,
+      isHidden: Boolean(projectConfig.hidden),
+      isCustomName: Boolean(projectConfig.displayName),
+      isManuallyAdded: true,
+      codexSessions: []
+    }));
   }
 
   projects.sort((leftProject, rightProject) => {
@@ -437,6 +497,43 @@ async function saveProjectConfig(config) {
   }
 
   await fs.writeFile(configPath, JSON.stringify(config, null, 2), 'utf8');
+}
+
+async function ensureCodexProjectConfigured(projectPath) {
+  const resolvedProjectPath = resolveProjectPath(projectPath);
+  if (!resolvedProjectPath) {
+    return null;
+  }
+
+  const config = await loadProjectConfig();
+  const normalizedTargetPath = normalizeComparablePath(resolvedProjectPath);
+  let projectName = null;
+
+  for (const [configuredProjectName, projectConfig] of Object.entries(config)) {
+    const configuredPath = projectConfig?.originalPath || projectConfig?.path;
+    if (normalizeComparablePath(configuredPath) !== normalizedTargetPath) {
+      continue;
+    }
+
+    projectName = configuredProjectName;
+    break;
+  }
+
+  const resolvedProjectName = projectName || encodeProjectNameFromPath(resolvedProjectPath);
+  const previousConfig = config[resolvedProjectName] || {};
+  const nextConfig = {
+    ...previousConfig,
+    manuallyAdded: true,
+    originalPath: resolvedProjectPath
+  };
+
+  config[resolvedProjectName] = nextConfig;
+  await saveProjectConfig(config);
+
+  return {
+    projectName: resolvedProjectName,
+    projectPath: resolvedProjectPath
+  };
 }
 
 function getLastPathSegment(projectPath) {
@@ -653,6 +750,7 @@ async function getProjects(progressCallback = null) {
         path: actualProjectDir,
         displayName: customName || autoDisplayName,
         fullPath: fullPath,
+        isHidden: Boolean(config[entry.name]?.hidden),
         isCustomName: !!customName,
         sessions: [],
         geminiSessions: [],
@@ -699,9 +797,6 @@ async function getProjects(progressCallback = null) {
         console.warn(`Could not load Codex sessions for project ${entry.name}:`, e.message);
         project.codexSessions = [];
       }
-      applyPersistedSessionTitles(project.codexSessions, 'codex');
-      applyCustomSessionNames(project.codexSessions, 'codex');
-
       // Also fetch Gemini sessions for this project (UI + CLI)
       try {
         const uiSessions = sessionManager.getProjectSessions(actualProjectDir) || [];
@@ -780,6 +875,7 @@ async function getProjects(progressCallback = null) {
         path: actualProjectDir,
         displayName: projectConfig.displayName || await generateDisplayName(projectName, actualProjectDir),
         fullPath: actualProjectDir,
+        isHidden: Boolean(projectConfig.hidden),
         isCustomName: !!projectConfig.displayName,
         isManuallyAdded: true,
         sessions: [],
@@ -809,9 +905,6 @@ async function getProjects(progressCallback = null) {
       } catch (e) {
         console.warn(`Could not load Codex sessions for manual project ${projectName}:`, e.message);
       }
-      applyPersistedSessionTitles(project.codexSessions, 'codex');
-      applyCustomSessionNames(project.codexSessions, 'codex');
-
       // Try to fetch Gemini sessions for manual projects too (UI + CLI)
       try {
         const uiSessions = sessionManager.getProjectSessions(actualProjectDir) || [];
@@ -1294,6 +1387,51 @@ async function renameProject(projectName, newDisplayName) {
   return true;
 }
 
+/**
+ * Persist the hidden state for a project in ~/.claude/project-config.json.
+ *
+ * @param {string} projectName Encoded project name; must not be empty.
+ * @param {boolean} hidden Whether the project should be hidden from the main list.
+ * @returns {Promise<boolean>} Returns true after the config file is saved.
+ * @throws {Error} Thrown when projectName is empty or config persistence fails.
+ */
+async function setProjectHiddenState(projectName, hidden) {
+  if (!projectName || typeof projectName !== 'string') {
+    throw new Error('Project name is required');
+  }
+
+  const config = await loadProjectConfig();
+  const existingConfig = config[projectName] || {};
+
+  if (hidden) {
+    let nextConfig = {
+      ...existingConfig,
+      hidden: true
+    };
+
+    if (!nextConfig.originalPath && !nextConfig.path) {
+      const resolvedProjectPath = await extractProjectDirectory(projectName);
+      if (resolvedProjectPath) {
+        nextConfig = {
+          ...nextConfig,
+          originalPath: resolvedProjectPath
+        };
+      }
+    }
+
+    config[projectName] = nextConfig;
+  } else if (config[projectName]) {
+    delete config[projectName].hidden;
+
+    if (Object.keys(config[projectName]).length === 0) {
+      delete config[projectName];
+    }
+  }
+
+  await saveProjectConfig(config);
+  return true;
+}
+
 // Delete a session from a project
 async function deleteSession(projectName, sessionId) {
   const projectDir = path.join(os.homedir(), '.claude', 'projects', projectName);
@@ -1384,7 +1522,7 @@ async function deleteProject(projectName, force = false) {
         const codexSessions = await getCodexSessions(projectPath, { limit: 0 });
         for (const session of codexSessions) {
           try {
-            await deleteCodexSession(session.id);
+            await deleteCodexSession(session.id, { permanent: true });
           } catch (err) {
             console.warn(`Failed to delete Codex session ${session.id}:`, err.message);
           }
@@ -1619,22 +1757,126 @@ async function findCodexJsonlFiles(dir) {
   return files;
 }
 
+async function findCodexSessionFileById(sessionId, options = {}) {
+  const { includeArchived = false } = options;
+  const searchDirectories = [CODEX_SESSIONS_DIR];
+
+  if (includeArchived) {
+    searchDirectories.push(CODEX_ARCHIVED_SESSIONS_DIR);
+  }
+
+  for (const directoryPath of searchDirectories) {
+    const jsonlFiles = await findCodexJsonlFiles(directoryPath);
+    const matchedFilePath = jsonlFiles.find((filePath) => path.basename(filePath).includes(sessionId));
+    if (matchedFilePath) {
+      return matchedFilePath;
+    }
+  }
+
+  return null;
+}
+
+async function resolveCodexRolloutPath(sessionId, preferredPath = null) {
+  if (preferredPath && await pathExists(preferredPath)) {
+    return preferredPath;
+  }
+
+  return findCodexSessionFileById(sessionId, { includeArchived: true });
+}
+
+async function moveCodexRolloutToArchive(sessionId, sourceFilePath) {
+  if (!sourceFilePath) {
+    throw new Error(`Codex rollout file not found for session ${sessionId}`);
+  }
+
+  const archivedFilePath = path.join(CODEX_ARCHIVED_SESSIONS_DIR, path.basename(sourceFilePath));
+  await fs.mkdir(CODEX_ARCHIVED_SESSIONS_DIR, { recursive: true });
+
+  if (isSameFilePath(sourceFilePath, archivedFilePath)) {
+    if (!await pathExists(sourceFilePath)) {
+      throw new Error(`Archived Codex rollout file missing for session ${sessionId}: ${sourceFilePath}`);
+    }
+
+    return sourceFilePath;
+  }
+
+  if (await pathExists(archivedFilePath)) {
+    if (await pathExists(sourceFilePath)) {
+      await fs.unlink(sourceFilePath);
+    }
+
+    return archivedFilePath;
+  }
+
+  if (!await pathExists(sourceFilePath)) {
+    throw new Error(`Codex rollout file not found for session ${sessionId}: ${sourceFilePath}`);
+  }
+
+  await fs.rename(sourceFilePath, archivedFilePath);
+  return archivedFilePath;
+}
+
+async function loadCodexThreadStateIndex() {
+  try {
+    await fs.access(CODEX_STATE_DB_PATH);
+  } catch {
+    return new Map();
+  }
+
+  let db;
+  try {
+    db = await open({
+      filename: CODEX_STATE_DB_PATH,
+      driver: sqlite3.Database,
+      mode: sqlite3.OPEN_READONLY
+    });
+
+    const rows = await db.all(`
+      SELECT id, archived, archived_at, title
+      FROM threads
+    `);
+
+    return new Map(
+      rows.map((row) => [
+        row.id,
+        {
+          archived: Boolean(row.archived),
+          archivedAt: row.archived_at ?? null,
+          title: normalizeCodexThreadTitle(row.title)
+        }
+      ])
+    );
+  } catch (error) {
+    console.warn('Could not read Codex thread state index:', error.message);
+    return new Map();
+  } finally {
+    if (db) {
+      await db.close();
+    }
+  }
+}
+
 async function buildCodexSessionsIndex() {
-  const codexSessionsDir = path.join(os.homedir(), '.codex', 'sessions');
   const sessionsByProject = new Map();
 
   try {
-    await fs.access(codexSessionsDir);
+    await fs.access(CODEX_SESSIONS_DIR);
   } catch (error) {
     return sessionsByProject;
   }
 
-  const jsonlFiles = await findCodexJsonlFiles(codexSessionsDir);
+  const jsonlFiles = await findCodexJsonlFiles(CODEX_SESSIONS_DIR);
+  const codexThreadStateIndex = await loadCodexThreadStateIndex();
 
   for (const filePath of jsonlFiles) {
     try {
       const sessionData = await parseCodexSessionFile(filePath);
       if (!sessionData || !sessionData.id) {
+        continue;
+      }
+
+      const threadState = codexThreadStateIndex.get(sessionData.id);
+      if (threadState?.archived) {
         continue;
       }
 
@@ -1645,7 +1887,7 @@ async function buildCodexSessionsIndex() {
 
       const session = {
         id: sessionData.id,
-        summary: sessionData.summary || 'Codex Session',
+        summary: threadState?.title || sessionData.summary || 'Codex Session',
         messageCount: sessionData.messageCount || 0,
         lastActivity: sessionData.timestamp ? new Date(sessionData.timestamp) : new Date(),
         cwd: resolveProjectPath(sessionData.cwd) || sessionData.cwd,
@@ -1686,9 +1928,10 @@ async function getCodexSessions(projectPath, options = {}) {
 
     const sessionsByProject = indexRef?.sessionsByProject || await buildCodexSessionsIndex();
     const sessions = sessionsByProject.get(normalizedProjectPath) || [];
+    const visibleSessions = limit > 0 ? sessions.slice(0, limit) : [...sessions];
 
     // Return limited sessions for performance (0 = unlimited for deletion)
-    return limit > 0 ? sessions.slice(0, limit) : [...sessions];
+    return visibleSessions;
 
   } catch (error) {
     console.error('Error fetching Codex sessions:', error);
@@ -1811,31 +2054,85 @@ async function parseCodexSessionFile(filePath) {
   }
 }
 
-// Get messages for a specific Codex session
-async function getCodexSessionMessages(sessionId, limit = null, offset = 0) {
+/**
+ * Read the first session metadata payload from a Codex rollout file.
+ *
+ * This is used to recover legacy SDK-only sessions that were written to disk
+ * without a matching `threads` row in `state_5.sqlite`.
+ */
+async function readCodexSessionMetaPayload(filePath) {
   try {
-    const codexSessionsDir = path.join(os.homedir(), '.codex', 'sessions');
+    const fileStream = fsSync.createReadStream(filePath);
+    const rl = readline.createInterface({
+      input: fileStream,
+      crlfDelay: Infinity
+    });
 
-    // Find the session file by searching for the session ID
-    const findSessionFile = async (dir) => {
-      try {
-        const entries = await fs.readdir(dir, { withFileTypes: true });
-        for (const entry of entries) {
-          const fullPath = path.join(dir, entry.name);
-          if (entry.isDirectory()) {
-            const found = await findSessionFile(fullPath);
-            if (found) return found;
-          } else if (entry.name.includes(sessionId) && entry.name.endsWith('.jsonl')) {
-            return fullPath;
-          }
-        }
-      } catch (error) {
-        // Skip directories we can't read
+    for await (const line of rl) {
+      if (!line.trim()) {
+        continue;
       }
-      return null;
-    };
 
-    const sessionFilePath = await findSessionFile(codexSessionsDir);
+      try {
+        const entry = JSON.parse(line);
+        if (entry.type === 'session_meta' && entry.payload) {
+          rl.close();
+          return entry.payload;
+        }
+      } catch {
+        continue;
+      }
+    }
+
+    return null;
+  } catch (error) {
+    console.error('Error reading Codex session metadata payload:', error);
+    return null;
+  }
+}
+
+/**
+ * Build the minimal `threads` record required to archive a legacy Codex session.
+ *
+ * Legacy SDK-only test sessions may have a rollout file but no thread entry.
+ * We synthesize the missing row so archive/delete keeps working without having
+ * to physically delete the session file.
+ */
+async function buildLegacyCodexThreadRecord(sessionId) {
+  const sessionFilePath = await findCodexSessionFileById(sessionId, { includeArchived: true });
+  if (!sessionFilePath) {
+    return null;
+  }
+
+  const [parsedSession, sessionMetaPayload, sessionStat] = await Promise.all([
+    parseCodexSessionFile(sessionFilePath),
+    readCodexSessionMetaPayload(sessionFilePath),
+    fs.stat(sessionFilePath)
+  ]);
+
+  const createdAtMs = Date.parse(sessionMetaPayload?.timestamp || parsedSession?.timestamp || new Date(sessionStat.mtimeMs).toISOString());
+  const archiveTimestamp = Math.floor(Date.now() / 1000);
+
+  return {
+    id: sessionId,
+    rolloutPath: sessionFilePath,
+    createdAt: Number.isFinite(createdAtMs) ? Math.floor(createdAtMs / 1000) : archiveTimestamp,
+    updatedAt: archiveTimestamp,
+    source: sessionMetaPayload?.source || 'exec',
+    modelProvider: sessionMetaPayload?.model_provider || 'openai',
+    cwd: sessionMetaPayload?.cwd || parsedSession?.cwd || '',
+    title: parsedSession?.summary || `Legacy Codex Session ${sessionId}`,
+    sandboxPolicy: 'workspace-write',
+    approvalMode: 'never',
+    cliVersion: sessionMetaPayload?.cli_version || '',
+    firstUserMessage: parsedSession?.summary || ''
+  };
+}
+
+// Read the raw messages for a single physical Codex session.
+async function getSingleCodexSessionMessages(sessionId) {
+  try {
+    const sessionFilePath = await findCodexSessionFileById(sessionId, { includeArchived: true });
 
     if (!sessionFilePath) {
       console.warn(`Codex session file not found for session ${sessionId}`);
@@ -1875,10 +2172,12 @@ async function getCodexSessionMessages(sessionId, limit = null, offset = 0) {
           // Extract token usage from token_count events (keep latest)
           if (entry.type === 'event_msg' && entry.payload?.type === 'token_count' && entry.payload?.info) {
             const info = entry.payload.info;
-            if (info.total_token_usage) {
+            const nextTokenUsage = extractCodexContextTokenUsageFromInfo(info);
+            if (nextTokenUsage) {
               tokenUsage = {
-                used: info.total_token_usage.total_tokens || 0,
-                total: info.model_context_window || 200000
+                used: nextTokenUsage.used,
+                total: nextTokenUsage.total,
+                breakdown: nextTokenUsage.breakdown
               };
             }
           }
@@ -2030,9 +2329,19 @@ async function getCodexSessionMessages(sessionId, limit = null, offset = 0) {
     // Sort by timestamp
     messages.sort((a, b) => new Date(a.timestamp || 0) - new Date(b.timestamp || 0));
 
+    return { messages, tokenUsage };
+
+  } catch (error) {
+    console.error(`Error reading Codex session messages for ${sessionId}:`, error);
+    return { messages: [], tokenUsage: null };
+  }
+}
+
+async function getCodexSessionMessages(sessionId, limit = null, offset = 0) {
+  try {
+    const { messages, tokenUsage = null } = await getSingleCodexSessionMessages(sessionId);
     const total = messages.length;
 
-    // Apply pagination if limit is specified
     if (limit !== null) {
       const startIndex = Math.max(0, total - offset - limit);
       const endIndex = total - offset;
@@ -2045,46 +2354,152 @@ async function getCodexSessionMessages(sessionId, limit = null, offset = 0) {
         hasMore,
         offset,
         limit,
-        tokenUsage
+        tokenUsage,
       };
     }
 
-    return { messages, tokenUsage };
-
+    return {
+      messages,
+      tokenUsage,
+    };
   } catch (error) {
     console.error(`Error reading Codex session messages for ${sessionId}:`, error);
-    return { messages: [], total: 0, hasMore: false };
+    return {
+      messages: [],
+      total: 0,
+      hasMore: false,
+      tokenUsage: null,
+    };
   }
 }
 
-async function deleteCodexSession(sessionId) {
+async function archiveCodexSession(sessionId) {
+  let db;
   try {
-    const codexSessionsDir = path.join(os.homedir(), '.codex', 'sessions');
+    await fs.access(CODEX_STATE_DB_PATH);
+    db = await open({
+      filename: CODEX_STATE_DB_PATH,
+      driver: sqlite3.Database,
+      mode: sqlite3.OPEN_READWRITE
+    });
 
-    const findJsonlFiles = async (dir) => {
-      const files = [];
-      try {
-        const entries = await fs.readdir(dir, { withFileTypes: true });
-        for (const entry of entries) {
-          const fullPath = path.join(dir, entry.name);
-          if (entry.isDirectory()) {
-            files.push(...await findJsonlFiles(fullPath));
-          } else if (entry.name.endsWith('.jsonl')) {
-            files.push(fullPath);
-          }
-        }
-      } catch (error) { }
-      return files;
-    };
+    const existingThread = await db.get(
+      `
+        SELECT id, rollout_path, archived, archived_at, cwd
+        FROM threads
+        WHERE id = ?
+      `,
+      sessionId
+    );
 
-    const jsonlFiles = await findJsonlFiles(codexSessionsDir);
+    const archiveTimestamp = Math.floor(Date.now() / 1000);
 
-    for (const filePath of jsonlFiles) {
-      const sessionData = await parseCodexSessionFile(filePath);
-      if (sessionData && sessionData.id === sessionId) {
-        await fs.unlink(filePath);
-        return true;
+    if (!existingThread) {
+      const legacyThreadRecord = await buildLegacyCodexThreadRecord(sessionId);
+      if (!legacyThreadRecord) {
+        throw new Error(`Codex thread not found for session ${sessionId}`);
       }
+
+      await ensureCodexProjectConfigured(legacyThreadRecord.cwd);
+      const archivedRolloutPath = await moveCodexRolloutToArchive(sessionId, legacyThreadRecord.rolloutPath);
+
+      await db.run(
+        `
+          INSERT INTO threads (
+            id,
+            rollout_path,
+            created_at,
+            updated_at,
+            source,
+            model_provider,
+            cwd,
+            title,
+            sandbox_policy,
+            approval_mode,
+            archived,
+            archived_at,
+            cli_version,
+            first_user_message
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
+        `,
+        legacyThreadRecord.id,
+        archivedRolloutPath,
+        legacyThreadRecord.createdAt,
+        legacyThreadRecord.updatedAt,
+        legacyThreadRecord.source,
+        legacyThreadRecord.modelProvider,
+        legacyThreadRecord.cwd,
+        legacyThreadRecord.title,
+        legacyThreadRecord.sandboxPolicy,
+        legacyThreadRecord.approvalMode,
+        archiveTimestamp,
+        legacyThreadRecord.cliVersion,
+        legacyThreadRecord.firstUserMessage
+      );
+
+      return true;
+    }
+
+    const resolvedRolloutPath = await resolveCodexRolloutPath(sessionId, existingThread.rollout_path);
+    if (!resolvedRolloutPath) {
+      throw new Error(`Codex rollout file not found for session ${sessionId}`);
+    }
+
+    const fallbackThreadRecord = !existingThread.cwd ? await buildLegacyCodexThreadRecord(sessionId) : null;
+    await ensureCodexProjectConfigured(existingThread.cwd || fallbackThreadRecord?.cwd || '');
+    const archivedRolloutPath = await moveCodexRolloutToArchive(sessionId, resolvedRolloutPath);
+
+    if (existingThread.archived) {
+      if (!isSameFilePath(existingThread.rollout_path, archivedRolloutPath)) {
+        await db.run(
+          `
+            UPDATE threads
+            SET rollout_path = ?
+            WHERE id = ?
+          `,
+          archivedRolloutPath,
+          sessionId
+        );
+      }
+
+      return true;
+    }
+
+    await db.run(
+      `
+        UPDATE threads
+        SET rollout_path = ?,
+            archived = 1,
+            archived_at = ?
+        WHERE id = ?
+      `,
+      archivedRolloutPath,
+      archiveTimestamp,
+      sessionId
+    );
+
+    return true;
+  } catch (error) {
+    console.error(`Error archiving Codex session ${sessionId}:`, error);
+    throw error;
+  } finally {
+    if (db) {
+      await db.close();
+    }
+  }
+}
+
+async function deleteCodexSession(sessionId, options = {}) {
+  const { permanent = false } = options;
+  if (!permanent) {
+    return archiveCodexSession(sessionId);
+  }
+
+  try {
+    const rolloutPath = await findCodexSessionFileById(sessionId, { includeArchived: true });
+    if (rolloutPath) {
+      await fs.unlink(rolloutPath);
+      return true;
     }
 
     throw new Error(`Codex session file not found for session ${sessionId}`);
@@ -2816,6 +3231,7 @@ export {
   getSessionMessages,
   parseJsonlSessions,
   renameProject,
+  setProjectHiddenState,
   deleteSession,
   isProjectEmpty,
   deleteProject,
@@ -2826,6 +3242,7 @@ export {
   clearProjectDirectoryCache,
   getCodexSessions,
   getCodexSessionMessages,
+  buildLegacyCodexThreadRecord,
   deleteCodexSession,
   getGeminiCliSessions,
   getGeminiCliSessionMessages,

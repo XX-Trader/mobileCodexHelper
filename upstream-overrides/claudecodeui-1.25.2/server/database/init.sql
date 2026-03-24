@@ -78,6 +78,21 @@ CREATE TABLE IF NOT EXISTS session_auto_titles (
 
 CREATE INDEX IF NOT EXISTS idx_session_auto_titles_lookup ON session_auto_titles(session_id, provider);
 
+-- Session unread-completion notifications (cross-tab/device sync)
+CREATE TABLE IF NOT EXISTS session_notifications (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    session_id TEXT NOT NULL,
+    provider TEXT NOT NULL DEFAULT 'claude',
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+    UNIQUE(user_id, session_id, provider)
+);
+
+CREATE INDEX IF NOT EXISTS idx_session_notifications_user_id ON session_notifications(user_id);
+CREATE INDEX IF NOT EXISTS idx_session_notifications_lookup ON session_notifications(user_id, session_id, provider);
+
 -- Approved devices (browser/app wrappers) that are allowed to log in for this single-user system
 CREATE TABLE IF NOT EXISTS trusted_devices (
     id INTEGER PRIMARY KEY AUTOINCREMENT,

@@ -34,6 +34,7 @@ const c = {
 console.log('PORT from env:', process.env.PORT);
 
 import express from 'express';
+import crypto from 'crypto';
 import { WebSocketServer, WebSocket } from 'ws';
 import os from 'os';
 import http from 'http';
@@ -44,10 +45,10 @@ import pty from 'node-pty';
 import fetch from 'node-fetch';
 import mime from 'mime-types';
 
-import { getProjects, getSessions, getSessionMessages, renameProject, deleteSession, deleteProject, addProjectManually, extractProjectDirectory, clearProjectDirectoryCache, searchConversations } from './projects.js';
+import { getProjects, getSessions, getSessionMessages, renameProject, setProjectHiddenState, deleteSession, deleteProject, addProjectManually, extractProjectDirectory, clearProjectDirectoryCache, searchConversations } from './projects.js';
 import { queryClaudeSDK, abortClaudeSDKSession, isClaudeSDKSessionActive, getActiveClaudeSDKSessions, resolveToolApproval, getPendingApprovalsForSession, reconnectSessionWriter } from './claude-sdk.js';
 import { spawnCursor, abortCursorSession, isCursorSessionActive, getActiveCursorSessions } from './cursor-cli.js';
-import { queryCodex, abortCodexSession, isCodexSessionActive, getActiveCodexSessions } from './openai-codex.js';
+import { queryCodex, abortCodexSession, isCodexSessionActive, getActiveCodexSessions, renameCodexSessionTitle } from './openai-codex.js';
 import { spawnGemini, abortGeminiSession, isGeminiSessionActive, getActiveGeminiSessions } from './gemini-cli.js';
 import sessionManager from './sessionManager.js';
 import gitRoutes from './routes/git.js';
@@ -66,7 +67,12 @@ import codexRoutes from './routes/codex.js';
 import geminiRoutes from './routes/gemini.js';
 import pluginsRoutes from './routes/plugins.js';
 import { startEnabledPluginServers, stopAllPlugins } from './utils/plugin-process-manager.js';
-import { initializeDatabase, sessionNamesDb, sessionAutoTitlesDb, applyPersistedSessionTitles, applyCustomSessionNames } from './database/db.js';
+import {
+    DEFAULT_CODEX_CONTEXT_WINDOW,
+    findCodexSessionFile,
+    readCodexSessionContextTokenUsage,
+} from './utils/codexTokenUsage.js';
+import { initializeDatabase, sessionNamesDb, sessionAutoTitlesDb, sessionNotificationsDb, applyPersistedSessionTitles, applyCustomSessionNames } from './database/db.js';
 import { validateApiKey, authenticateToken, authenticateWebSocketRequest } from './middleware/auth.js';
 import { IS_PLATFORM } from './constants/config.js';
 
@@ -116,6 +122,250 @@ function broadcastProgress(progress) {
 function blockDisabledFeature(res, feature) {
     return res.status(403).json({
         error: `${feature} is disabled in Codex-only hardened mode`
+    });
+}
+
+const CHAT_ATTACHMENT_ROOT = path.join(os.tmpdir(), 'mobile-codex-helper', 'chat-attachments');
+const CHAT_ATTACHMENT_MAX_FILE_BYTES = 20 * 1024 * 1024;
+const CHAT_ATTACHMENT_MAX_FILE_COUNT = 15;
+const CHAT_ATTACHMENT_RETENTION_MS = 24 * 60 * 60 * 1000;
+const CHAT_ATTACHMENT_TEXT_PREVIEW_MAX_BYTES = 4 * 1024 * 1024;
+const CHAT_ATTACHMENT_MARKDOWN_EXTENSIONS = new Set(['.md', '.markdown', '.mdown', '.mkd']);
+const CHAT_ATTACHMENT_TEXT_EXTENSIONS = new Set([
+    '.txt',
+    '.log',
+    '.json',
+    '.yaml',
+    '.yml',
+    '.toml',
+    '.ini',
+    '.cfg',
+    '.conf',
+    '.xml',
+    '.csv',
+    '.tsv',
+    '.js',
+    '.jsx',
+    '.ts',
+    '.tsx',
+    '.mjs',
+    '.cjs',
+    '.py',
+    '.go',
+    '.java',
+    '.rb',
+    '.php',
+    '.sh',
+    '.ps1',
+    '.bat',
+    '.sql',
+]);
+
+function parseBooleanQueryValue(value) {
+    if (typeof value !== 'string') {
+        return false;
+    }
+
+    const normalizedValue = value.trim().toLowerCase();
+    return normalizedValue === '1' || normalizedValue === 'true' || normalizedValue === 'yes';
+}
+
+function parsePositiveIntegerQueryValue(value) {
+    if (typeof value !== 'string' || value.trim().length === 0) {
+        return null;
+    }
+
+    const parsedValue = Number.parseInt(value, 10);
+    if (!Number.isFinite(parsedValue) || parsedValue <= 0) {
+        return null;
+    }
+
+    return parsedValue;
+}
+
+function buildChatAttachmentProjectKey(projectName) {
+    return crypto.createHash('sha1').update(String(projectName || '')).digest('hex');
+}
+
+function getChatAttachmentProjectRoot(userId, projectName) {
+    return path.join(
+        CHAT_ATTACHMENT_ROOT,
+        String(userId || 'anonymous'),
+        buildChatAttachmentProjectKey(projectName),
+    );
+}
+
+function sanitizeChatAttachmentFilename(fileName) {
+    const rawName = typeof fileName === 'string' ? fileName : 'attachment';
+    const extension = path.extname(rawName).replace(/[^a-zA-Z0-9.]/g, '').slice(0, 20);
+    const baseName = path.basename(rawName, extension).replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 80) || 'attachment';
+    return `${baseName}${extension}`;
+}
+
+function isPathInsideRoot(candidatePath, rootPath) {
+    const resolvedCandidate = path.resolve(candidatePath);
+    const resolvedRoot = path.resolve(rootPath);
+    return resolvedCandidate === resolvedRoot || resolvedCandidate.startsWith(`${resolvedRoot}${path.sep}`);
+}
+
+async function cleanupExpiredChatAttachmentBatches(projectRoot) {
+    let entries = [];
+    try {
+        entries = await fsPromises.readdir(projectRoot, { withFileTypes: true });
+    } catch (error) {
+        if (error.code !== 'ENOENT') {
+            throw error;
+        }
+        return;
+    }
+
+    const expirationCutoff = Date.now() - CHAT_ATTACHMENT_RETENTION_MS;
+    await Promise.all(entries.map(async (entry) => {
+        if (!entry.isDirectory()) {
+            return;
+        }
+
+        const entryPath = path.join(projectRoot, entry.name);
+        try {
+            const stats = await fsPromises.stat(entryPath);
+            if (stats.mtimeMs < expirationCutoff) {
+                await fsPromises.rm(entryPath, { recursive: true, force: true });
+            }
+        } catch (error) {
+            console.warn('Failed to clean expired chat attachment batch:', entryPath, error);
+        }
+    }));
+}
+
+function buildChatAttachmentPreviewUrl(projectName, filePath) {
+    const encodedProjectName = encodeURIComponent(projectName);
+    const encodedFilePath = encodeURIComponent(filePath);
+    return `/api/projects/${encodedProjectName}/chat-attachments/content?filePath=${encodedFilePath}`;
+}
+
+function buildChatAttachmentDownloadUrl(projectName, filePath) {
+    return `${buildChatAttachmentPreviewUrl(projectName, filePath)}&download=1`;
+}
+
+function resolveChatAttachmentPreviewKind(fileName, mimeType) {
+    const normalizedMimeType = String(mimeType || '').toLowerCase();
+    const extension = path.extname(String(fileName || '')).toLowerCase();
+
+    if (normalizedMimeType.startsWith('image/')) {
+        return 'image';
+    }
+
+    if (normalizedMimeType === 'text/markdown' || CHAT_ATTACHMENT_MARKDOWN_EXTENSIONS.has(extension)) {
+        return 'markdown';
+    }
+
+    if (
+        normalizedMimeType.startsWith('text/') ||
+        normalizedMimeType === 'application/json' ||
+        normalizedMimeType === 'application/xml' ||
+        normalizedMimeType === 'application/yaml' ||
+        normalizedMimeType === 'application/x-yaml' ||
+        normalizedMimeType === 'application/toml' ||
+        CHAT_ATTACHMENT_TEXT_EXTENSIONS.has(extension)
+    ) {
+        return 'text';
+    }
+
+    return 'unsupported';
+}
+
+function buildChatAttachmentResponse(projectName, filePath, options = {}) {
+    const attachmentName = options.name || path.basename(filePath);
+    const mimeType = options.mimeType || mime.lookup(filePath) || 'application/octet-stream';
+    const contentUrl = buildChatAttachmentPreviewUrl(projectName, filePath);
+    const previewKind = resolveChatAttachmentPreviewKind(attachmentName, mimeType);
+
+    return {
+        name: attachmentName,
+        path: filePath,
+        size: options.size,
+        mimeType,
+        kind: mimeType.startsWith('image/') ? 'image' : 'file',
+        previewKind,
+        previewUrl: contentUrl,
+        contentUrl,
+        downloadUrl: buildChatAttachmentDownloadUrl(projectName, filePath),
+    };
+}
+
+function isValidSessionProvider(provider) {
+    return typeof provider === 'string' && VALID_PROVIDERS.includes(provider);
+}
+
+function matchesUserConnection(client, userId) {
+    return String(client?.user?.id || '') === String(userId || '');
+}
+
+function collectKnownCodexSessionIds(projects) {
+    const knownSessionIds = new Set();
+
+    if (!Array.isArray(projects)) {
+        return knownSessionIds;
+    }
+
+    projects.forEach((project) => {
+        const codexSessions = Array.isArray(project?.codexSessions) ? project.codexSessions : [];
+        codexSessions.forEach((session) => {
+            if (typeof session?.id === 'string' && session.id.length > 0) {
+                knownSessionIds.add(session.id);
+            }
+        });
+    });
+
+    return knownSessionIds;
+}
+
+async function getUnreadCompletedSessionPayload(userId) {
+    const unreadCompletedSessions = sessionNotificationsDb.getUnreadCompletedSessions(userId);
+
+    if (!userId || unreadCompletedSessions.length === 0 || !CODEX_ONLY_HARDENED_MODE) {
+        return { unreadCompletedSessions };
+    }
+
+    try {
+        const projects = await getProjects();
+        const knownCodexSessionIds = collectKnownCodexSessionIds(projects);
+        const staleUnreadSessionIds = unreadCompletedSessions.filter((sessionId) => !knownCodexSessionIds.has(sessionId));
+
+        if (staleUnreadSessionIds.length > 0) {
+            const removedCount = sessionNotificationsDb.markCompletedSessionsAsRead(
+                userId,
+                staleUnreadSessionIds,
+                'codex'
+            );
+            console.warn(
+                `[SessionNotifications] Pruned ${removedCount} stale Codex unread notification(s) for user ${userId}: ${staleUnreadSessionIds.join(', ')}`
+            );
+        }
+
+        return {
+            unreadCompletedSessions: unreadCompletedSessions.filter((sessionId) => knownCodexSessionIds.has(sessionId))
+        };
+    } catch (error) {
+        console.warn('[SessionNotifications] Failed to reconcile unread session notifications:', error);
+        return { unreadCompletedSessions };
+    }
+}
+
+async function broadcastSessionNotificationsState(userId) {
+    if (!userId) {
+        return;
+    }
+
+    const message = JSON.stringify({
+        type: 'session-notifications-state',
+        ...await getUnreadCompletedSessionPayload(userId)
+    });
+
+    connectedClients.forEach((client) => {
+        if (client.readyState === WebSocket.OPEN && matchesUserConnection(client, userId)) {
+            client.send(message);
+        }
     });
 }
 
@@ -402,7 +652,7 @@ app.use('/api/settings', authenticateToken, CODEX_ONLY_HARDENED_MODE ? codexOnly
 app.use('/api/cli', authenticateToken, CODEX_ONLY_HARDENED_MODE ? codexOnlyMiddleware('CLI auth routes') : cliAuthRoutes);
 
 // User API Routes (protected)
-app.use('/api/user', authenticateToken, CODEX_ONLY_HARDENED_MODE ? codexOnlyMiddleware('User management routes') : userRoutes);
+app.use('/api/user', authenticateToken, userRoutes);
 
 // Codex API Routes (protected)
 app.use('/api/codex', authenticateToken, codexRoutes);
@@ -417,6 +667,53 @@ app.use('/api/plugins', authenticateToken, CODEX_ONLY_HARDENED_MODE ? codexOnlyM
 
 // Agent API Routes (uses API key authentication)
 app.use('/api/agent', CODEX_ONLY_HARDENED_MODE ? codexOnlyMiddleware('Agent API') : agentRoutes);
+
+app.get('/api/session-notifications/unread', authenticateToken, (req, res) => {
+    try {
+        void getUnreadCompletedSessionPayload(req.user?.id)
+            .then((payload) => {
+                res.json(payload);
+            })
+            .catch((error) => {
+                console.error('[API] Error fetching unread session notifications:', error);
+                res.status(500).json({ error: error.message });
+            });
+    } catch (error) {
+        console.error('[API] Error fetching unread session notifications:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+app.post('/api/session-notifications/read', authenticateToken, (req, res) => {
+    try {
+        const { sessionId, provider } = req.body || {};
+        if (typeof sessionId !== 'string' || sessionId.trim().length === 0) {
+            return res.status(400).json({ error: 'sessionId is required' });
+        }
+        if (provider !== undefined && provider !== null && !isValidSessionProvider(provider)) {
+            return res.status(400).json({ error: `Provider must be one of: ${VALID_PROVIDERS.join(', ')}` });
+        }
+
+        sessionNotificationsDb.markCompletedSessionAsRead(
+            req.user?.id,
+            sessionId.trim(),
+            provider ?? null
+        );
+        void broadcastSessionNotificationsState(req.user?.id);
+
+        return void getUnreadCompletedSessionPayload(req.user?.id)
+            .then((payload) => {
+                res.json(payload);
+            })
+            .catch((error) => {
+                console.error('[API] Error fetching unread session notifications after acknowledge:', error);
+                res.status(500).json({ error: error.message });
+            });
+    } catch (error) {
+        console.error('[API] Error acknowledging unread session notification:', error);
+        return res.status(500).json({ error: error.message });
+    }
+});
 
 // Serve public files (like api-docs.html)
 app.use(express.static(path.join(__dirname, '../public')));
@@ -581,6 +878,37 @@ app.put('/api/projects/:projectName/rename', authenticateToken, async (req, res)
     }
 });
 
+app.put('/api/projects/:projectName/hidden', authenticateToken, async (req, res) => {
+    try {
+        const { hidden } = req.body;
+
+        if (typeof hidden !== 'boolean') {
+            return res.status(400).json({ error: 'hidden must be a boolean' });
+        }
+
+        await setProjectHiddenState(req.params.projectName, hidden);
+
+        const updatedProjects = await getProjects(broadcastProgress);
+        const updateMessage = JSON.stringify({
+            type: 'projects_updated',
+            projects: updatedProjects,
+            timestamp: new Date().toISOString(),
+            changeType: hidden ? 'hide' : 'restore',
+            changedProject: req.params.projectName,
+        });
+
+        connectedClients.forEach(client => {
+            if (client.readyState === WebSocket.OPEN) {
+                client.send(updateMessage);
+            }
+        });
+
+        res.json({ success: true });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
 // Delete session endpoint
 app.delete('/api/projects/:projectName/sessions/:sessionId', authenticateToken, async (req, res) => {
     if (CODEX_ONLY_HARDENED_MODE) {
@@ -593,6 +921,8 @@ app.delete('/api/projects/:projectName/sessions/:sessionId', authenticateToken, 
         await deleteSession(projectName, sessionId);
         sessionNamesDb.deleteName(sessionId, 'claude');
         sessionAutoTitlesDb.deleteTitle(sessionId, 'claude');
+        sessionNotificationsDb.markCompletedSessionAsRead(req.user?.id, sessionId);
+        void broadcastSessionNotificationsState(req.user?.id);
         console.log(`[API] Session ${sessionId} deleted successfully`);
         res.json({ success: true });
     } catch (error) {
@@ -603,10 +933,6 @@ app.delete('/api/projects/:projectName/sessions/:sessionId', authenticateToken, 
 
 // Rename session endpoint
 app.put('/api/sessions/:sessionId/rename', authenticateToken, async (req, res) => {
-    if (CODEX_ONLY_HARDENED_MODE) {
-        return blockDisabledFeature(res, 'Session rename');
-    }
-
     try {
         const { sessionId } = req.params;
         const safeSessionId = String(sessionId).replace(/[^a-zA-Z0-9._-]/g, '');
@@ -623,6 +949,18 @@ app.put('/api/sessions/:sessionId/rename', authenticateToken, async (req, res) =
         if (!provider || !VALID_PROVIDERS.includes(provider)) {
             return res.status(400).json({ error: `Provider must be one of: ${VALID_PROVIDERS.join(', ')}` });
         }
+
+        if (CODEX_ONLY_HARDENED_MODE && provider !== 'codex') {
+            return blockDisabledFeature(res, 'Session rename');
+        }
+
+        if (provider === 'codex') {
+            await renameCodexSessionTitle(safeSessionId, summary.trim());
+            sessionNamesDb.deleteName(safeSessionId, 'codex');
+            sessionAutoTitlesDb.deleteTitle(safeSessionId, 'codex');
+            return res.json({ success: true });
+        }
+
         sessionNamesDb.setName(safeSessionId, provider, summary.trim());
         res.json({ success: true });
     } catch (error) {
@@ -1532,6 +1870,7 @@ app.post('/api/projects/:projectName/files/upload', authenticateToken, async (re
 wss.on('connection', (ws, request) => {
     const url = request.url;
     console.log('[INFO] Client connected to:', url);
+    ws.user = request.user || null;
 
     // Parse URL to get pathname without query parameters
     const urlObj = new URL(url, 'http://localhost');
@@ -1562,11 +1901,80 @@ class WebSocketWriter {
     constructor(ws) {
         this.ws = ws;
         this.sessionId = null;
+        this.sessionProviders = new Map();
         this.isWebSocketWriter = true;  // Marker for transport detection
+    }
+
+    rememberSessionProvider(sessionId, provider) {
+        if (!sessionId || !isValidSessionProvider(provider)) {
+            return;
+        }
+
+        this.sessionProviders.set(sessionId, provider);
+    }
+
+    resolveSessionProviderForNotification(data) {
+        const sessionId = typeof data?.sessionId === 'string' ? data.sessionId : null;
+        if (!sessionId) {
+            return null;
+        }
+
+        if (isValidSessionProvider(data?.provider)) {
+            return data.provider;
+        }
+
+        if (typeof data?.type === 'string') {
+            if (data.type.startsWith('cursor-')) {
+                return 'cursor';
+            }
+
+            if (data.type.startsWith('gemini-')) {
+                return 'gemini';
+            }
+
+            if (data.type.startsWith('codex-')) {
+                return 'codex';
+            }
+        }
+
+        if (sessionId.startsWith('gemini_')) {
+            return 'gemini';
+        }
+
+        return this.sessionProviders.get(sessionId) || null;
+    }
+
+    syncSessionNotificationState(data) {
+        if (!data || typeof data !== 'object') {
+            return;
+        }
+
+        const sessionId = typeof data.sessionId === 'string' ? data.sessionId : null;
+        const provider = this.resolveSessionProviderForNotification(data);
+        if (sessionId && provider) {
+            this.rememberSessionProvider(sessionId, provider);
+        }
+
+        const isSuccessfulCompletion = (
+            data.type === 'codex-complete'
+            || (data.type === 'claude-complete' && (data.exitCode === 0 || data.exitCode === undefined))
+        );
+        if (!isSuccessfulCompletion || !sessionId || !this.ws.user?.id) {
+            return;
+        }
+
+        const completionProvider = provider || 'claude';
+        if (!sessionNotificationsDb.setUnreadCompletedSession(this.ws.user.id, sessionId, completionProvider)) {
+            return;
+        }
+
+        this.sessionProviders.delete(sessionId);
+        void broadcastSessionNotificationsState(this.ws.user.id);
     }
 
     send(data) {
         if (this.ws.readyState === 1) { // WebSocket.OPEN
+            this.syncSessionNotificationState(data);
             // Providers send raw objects, we stringify for WebSocket
             this.ws.send(JSON.stringify(data));
         }
@@ -1594,6 +2002,43 @@ function handleChatConnection(ws) {
 
     // Wrap WebSocket with writer for consistent interface with SSEStreamWriter
     const writer = new WebSocketWriter(ws);
+    const resolveActiveSessionsForProvider = (sessionProvider) => {
+        if (sessionProvider === 'cursor') {
+            return getActiveCursorSessions();
+        }
+
+        if (sessionProvider === 'codex') {
+            return getActiveCodexSessions();
+        }
+
+        if (sessionProvider === 'gemini') {
+            return getActiveGeminiSessions();
+        }
+
+        return getActiveClaudeSDKSessions();
+    };
+    const resolveSessionStartedAt = (sessionProvider, sessionId) => {
+        if (!sessionId) {
+            return null;
+        }
+
+        const activeSessions = resolveActiveSessionsForProvider(sessionProvider);
+        if (!Array.isArray(activeSessions)) {
+            return null;
+        }
+
+        for (const currentSession of activeSessions) {
+            if (!currentSession || typeof currentSession !== 'object') {
+                continue;
+            }
+
+            if (currentSession.id === sessionId && currentSession.startedAt) {
+                return currentSession.startedAt;
+            }
+        }
+
+        return null;
+    };
 
     ws.on('message', async (message) => {
         try {
@@ -1606,7 +2051,8 @@ function handleChatConnection(ws) {
                     'codex-command',
                     'abort-session',
                     'check-session-status',
-                    'get-active-sessions'
+                    'get-active-sessions',
+                    'get-session-notifications'
                 ]);
                 const isCodexProviderMessage = data.type === 'codex-command' || provider === 'codex';
                 if (!allowedMessageTypes.has(data.type) || !isCodexProviderMessage) {
@@ -1697,6 +2143,7 @@ function handleChatConnection(ws) {
                 // Check if a specific session is currently processing
                 const sessionId = data.sessionId;
                 let isActive;
+                let startedAt = null;
 
                 if (provider === 'cursor') {
                     isActive = isCursorSessionActive(sessionId);
@@ -1714,11 +2161,16 @@ function handleChatConnection(ws) {
                     }
                 }
 
+                if (isActive) {
+                    startedAt = resolveSessionStartedAt(provider, sessionId);
+                }
+
                 writer.send({
                     type: 'session-status',
                     sessionId,
                     provider,
-                    isProcessing: isActive
+                    isProcessing: isActive,
+                    startedAt
                 });
             } else if (data.type === 'get-pending-permissions') {
                 // Return pending permission requests for a session
@@ -1744,6 +2196,11 @@ function handleChatConnection(ws) {
                 writer.send({
                     type: 'active-sessions',
                     sessions: activeSessions
+                });
+            } else if (data.type === 'get-session-notifications') {
+                writer.send({
+                    type: 'session-notifications-state',
+                    ...await getUnreadCompletedSessionPayload(ws.user?.id)
                 });
             }
         } catch (error) {
@@ -2273,6 +2730,162 @@ Agent instructions:`;
     }
 });
 
+// Chat attachment preview endpoint
+app.get('/api/projects/:projectName/chat-attachments/content', authenticateToken, async (req, res) => {
+    try {
+        const { projectName } = req.params;
+        const filePath = typeof req.query.filePath === 'string' ? req.query.filePath : '';
+        const shouldDownload = parseBooleanQueryValue(req.query.download);
+        const requestedMaxBytes = parsePositiveIntegerQueryValue(req.query.maxBytes);
+        const maxBytes = requestedMaxBytes
+            ? Math.min(requestedMaxBytes, CHAT_ATTACHMENT_TEXT_PREVIEW_MAX_BYTES)
+            : null;
+        if (!filePath) {
+            return res.status(400).json({ error: 'Invalid attachment path' });
+        }
+
+        const projectRoot = await extractProjectDirectory(projectName).catch(() => null);
+        if (!projectRoot) {
+            return res.status(404).json({ error: 'Project not found' });
+        }
+
+        const attachmentRoot = getChatAttachmentProjectRoot(req.user?.id, projectName);
+        const resolvedPath = path.resolve(filePath);
+        if (!isPathInsideRoot(resolvedPath, attachmentRoot)) {
+            return res.status(403).json({ error: 'Attachment path is outside the allowed directory' });
+        }
+
+        await fsPromises.access(resolvedPath);
+        const mimeType = mime.lookup(resolvedPath) || 'application/octet-stream';
+        const previewKind = resolveChatAttachmentPreviewKind(path.basename(resolvedPath), mimeType);
+        const fileStats = await fsPromises.stat(resolvedPath);
+        if (maxBytes !== null && !['markdown', 'text'].includes(previewKind)) {
+            return res.status(400).json({ error: 'Byte-limited preview is only supported for text attachments' });
+        }
+
+        res.setHeader('Content-Type', mimeType);
+        res.setHeader('X-Chat-Attachment-File-Name', encodeURIComponent(path.basename(resolvedPath)));
+        res.setHeader('X-Chat-Attachment-Preview-Kind', previewKind);
+        res.setHeader('X-Chat-Attachment-Original-Size', String(fileStats.size));
+        res.setHeader(
+            'Content-Disposition',
+            `${shouldDownload ? 'attachment' : 'inline'}; filename*=UTF-8''${encodeURIComponent(path.basename(resolvedPath))}`,
+        );
+
+        if (maxBytes !== null) {
+            res.setHeader('X-Chat-Attachment-Max-Bytes', String(maxBytes));
+            if (fileStats.size > maxBytes) {
+                res.setHeader('X-Chat-Attachment-Truncated', '1');
+            }
+
+            const effectivePreviewBytes = Math.min(fileStats.size, maxBytes);
+            res.setHeader('Content-Length', String(effectivePreviewBytes));
+            if (effectivePreviewBytes === 0) {
+                return res.end();
+            }
+        }
+
+        const fileStream = maxBytes !== null
+            ? fs.createReadStream(resolvedPath, { start: 0, end: Math.max(maxBytes - 1, 0) })
+            : fs.createReadStream(resolvedPath);
+        fileStream.pipe(res);
+        fileStream.on('error', (error) => {
+            console.error('Error streaming chat attachment preview:', error);
+            if (!res.headersSent) {
+                res.status(500).json({ error: 'Failed to read chat attachment' });
+            }
+        });
+    } catch (error) {
+        console.error('Error serving chat attachment preview:', error);
+        if (!res.headersSent) {
+            if (error.code === 'ENOENT') {
+                res.status(404).json({ error: 'Attachment not found' });
+            } else {
+                res.status(500).json({ error: error.message });
+            }
+        }
+    }
+});
+
+// Chat attachment upload endpoint
+app.post('/api/projects/:projectName/chat-attachments', authenticateToken, async (req, res) => {
+    let batchRoot = null;
+
+    try {
+        const { projectName } = req.params;
+        const projectRoot = await extractProjectDirectory(projectName).catch(() => null);
+        if (!projectRoot) {
+            return res.status(404).json({ error: 'Project not found' });
+        }
+
+        const attachmentProjectRoot = getChatAttachmentProjectRoot(req.user?.id, projectName);
+        await fsPromises.mkdir(attachmentProjectRoot, { recursive: true });
+        await cleanupExpiredChatAttachmentBatches(attachmentProjectRoot);
+
+        batchRoot = path.join(attachmentProjectRoot, crypto.randomUUID());
+        await fsPromises.mkdir(batchRoot, { recursive: true });
+
+        const multer = (await import('multer')).default;
+        const upload = multer({
+            storage: multer.diskStorage({
+                destination: (_request, _file, callback) => {
+                    callback(null, batchRoot);
+                },
+                filename: (_request, file, callback) => {
+                    const safeName = sanitizeChatAttachmentFilename(file.originalname);
+                    callback(null, `${Date.now()}-${safeName}`);
+                },
+            }),
+            limits: {
+                fileSize: CHAT_ATTACHMENT_MAX_FILE_BYTES,
+                files: CHAT_ATTACHMENT_MAX_FILE_COUNT,
+            },
+        });
+
+        upload.array('files', CHAT_ATTACHMENT_MAX_FILE_COUNT)(req, res, async (error) => {
+            if (error) {
+                console.error('Chat attachment upload error:', error);
+                await fsPromises.rm(batchRoot, { recursive: true, force: true }).catch(() => { });
+                if (error.code === 'LIMIT_FILE_SIZE') {
+                    return res.status(400).json({ error: 'Attachment too large. Maximum size is 20MB.' });
+                }
+                if (error.code === 'LIMIT_FILE_COUNT') {
+                    return res.status(400).json({ error: `Too many attachments. Maximum is ${CHAT_ATTACHMENT_MAX_FILE_COUNT}.` });
+                }
+                return res.status(400).json({ error: error.message });
+            }
+
+            if (!Array.isArray(req.files) || req.files.length === 0) {
+                await fsPromises.rm(batchRoot, { recursive: true, force: true }).catch(() => { });
+                return res.status(400).json({ error: 'No attachments provided' });
+            }
+
+            try {
+                const attachments = req.files.map((file) => {
+                    const resolvedPath = path.resolve(file.path);
+                    return buildChatAttachmentResponse(projectName, resolvedPath, {
+                        name: file.originalname || path.basename(resolvedPath),
+                        size: file.size,
+                        mimeType: file.mimetype || mime.lookup(resolvedPath) || 'application/octet-stream',
+                    });
+                });
+
+                res.json({ attachments });
+            } catch (handlerError) {
+                console.error('Error building chat attachment response:', handlerError);
+                await fsPromises.rm(batchRoot, { recursive: true, force: true }).catch(() => { });
+                res.status(500).json({ error: 'Failed to process uploaded attachments' });
+            }
+        });
+    } catch (error) {
+        console.error('Error in chat attachment upload endpoint:', error);
+        if (batchRoot) {
+            await fsPromises.rm(batchRoot, { recursive: true, force: true }).catch(() => { });
+        }
+        res.status(500).json({ error: error.message || 'Internal server error' });
+    }
+});
+
 // Image upload endpoint
 app.post('/api/projects/:projectName/upload-images', authenticateToken, async (req, res) => {
     if (CODEX_ONLY_HARDENED_MODE) {
@@ -2367,7 +2980,6 @@ app.get('/api/projects/:projectName/sessions/:sessionId/token-usage', authentica
     try {
         const { projectName, sessionId } = req.params;
         const { provider = CODEX_ONLY_HARDENED_MODE ? 'codex' : 'claude' } = req.query;
-        const homeDir = os.homedir();
 
         if (CODEX_ONLY_HARDENED_MODE && provider !== 'codex') {
             return blockDisabledFeature(res, 'Non-Codex token usage lookup');
@@ -2406,78 +3018,33 @@ app.get('/api/projects/:projectName/sessions/:sessionId/token-usage', authentica
             if (safeSessionId.startsWith('codex-')) {
                 return res.json({
                     used: 0,
-                    total: 200000,
+                    total: DEFAULT_CODEX_CONTEXT_WINDOW,
                     pending: true,
                     message: 'Codex session is still being materialized'
                 });
             }
 
-            const codexSessionsDir = path.join(homeDir, '.codex', 'sessions');
-
-            // Find the session file by searching for the session ID
-            const findSessionFile = async (dir) => {
-                try {
-                    const entries = await fsPromises.readdir(dir, { withFileTypes: true });
-                    for (const entry of entries) {
-                        const fullPath = path.join(dir, entry.name);
-                        if (entry.isDirectory()) {
-                            const found = await findSessionFile(fullPath);
-                            if (found) return found;
-                        } else if (entry.name.includes(safeSessionId) && entry.name.endsWith('.jsonl')) {
-                            return fullPath;
-                        }
-                    }
-                } catch (error) {
-                    // Skip directories we can't read
-                }
-                return null;
-            };
-
-            const sessionFilePath = await findSessionFile(codexSessionsDir);
+            const sessionFilePath = await findCodexSessionFile(safeSessionId);
 
             if (!sessionFilePath) {
                 return res.status(404).json({ error: 'Codex session file not found', sessionId: safeSessionId });
             }
 
-            // Read and parse the Codex JSONL file
-            let fileContent;
-            try {
-                fileContent = await fsPromises.readFile(sessionFilePath, 'utf8');
-            } catch (error) {
-                if (error.code === 'ENOENT') {
-                    return res.status(404).json({ error: 'Session file not found', path: sessionFilePath });
-                }
-                throw error;
-            }
-            const lines = fileContent.trim().split('\n');
-            let totalTokens = 0;
-            let contextWindow = 200000; // Default for Codex/OpenAI
+            const tokenUsage = await readCodexSessionContextTokenUsage(safeSessionId);
 
-            // Find the latest token_count event with info (scan from end)
-            for (let i = lines.length - 1; i >= 0; i--) {
-                try {
-                    const entry = JSON.parse(lines[i]);
-
-                    // Codex stores token info in event_msg with type: "token_count"
-                    if (entry.type === 'event_msg' && entry.payload?.type === 'token_count' && entry.payload?.info) {
-                        const tokenInfo = entry.payload.info;
-                        if (tokenInfo.total_token_usage) {
-                            totalTokens = tokenInfo.total_token_usage.total_tokens || 0;
-                        }
-                        if (tokenInfo.model_context_window) {
-                            contextWindow = tokenInfo.model_context_window;
-                        }
-                        break; // Stop after finding the latest token count
-                    }
-                } catch (parseError) {
-                    // Skip lines that can't be parsed
-                    continue;
-                }
+            if (!tokenUsage) {
+                return res.json({
+                    used: 0,
+                    total: DEFAULT_CODEX_CONTEXT_WINDOW,
+                    pending: true,
+                    message: 'Codex token usage snapshot is not available yet'
+                });
             }
 
             return res.json({
-                used: totalTokens,
-                total: contextWindow
+                used: tokenUsage.used,
+                total: tokenUsage.total,
+                breakdown: tokenUsage.breakdown
             });
         }
 

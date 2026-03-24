@@ -19,6 +19,17 @@ type TaskMasterSidebarContext = {
   mcpServerStatus: MCPServerStatus;
 };
 
+const normalizeConversationSessionProvider = (provider: string): SessionProvider => {
+  switch (provider) {
+    case 'cursor':
+    case 'codex':
+    case 'gemini':
+      return provider;
+    default:
+      return 'claude';
+  }
+};
+
 function Sidebar({
   projects,
   selectedProject,
@@ -38,6 +49,10 @@ function Sidebar({
   showSettings,
   settingsInitialTab,
   onCloseSettings,
+  sessionDeleteConfirmation,
+  isDeletingSession,
+  onCancelDeleteSession,
+  onConfirmDeleteSession,
   isMobile,
 }: SidebarProps) {
   const { t } = useTranslation(['sidebar', 'common']);
@@ -72,7 +87,9 @@ function Sidebar({
     clearConversationResults,
     deletingProjects,
     deleteConfirmation,
-    sessionDeleteConfirmation,
+    showHiddenProjects,
+    hiddenProjects,
+    hiddenProjectNamesInFlight,
     showVersionModal,
     filteredProjects,
     toggleProject,
@@ -84,7 +101,8 @@ function Sidebar({
     cancelEditing,
     saveProjectName,
     showDeleteSessionConfirmation,
-    confirmDeleteSession,
+    hideProjectFromSidebar,
+    restoreHiddenProject,
     requestProjectDelete,
     confirmDeleteProject,
     loadMoreSessions,
@@ -99,7 +117,7 @@ function Sidebar({
     setEditingSessionName,
     setSearchFilter,
     setDeleteConfirmation,
-    setSessionDeleteConfirmation,
+    setShowHiddenProjects,
     setShowVersionModal,
   } = useSidebarController({
     projects,
@@ -113,6 +131,7 @@ function Sidebar({
     onSessionSelect,
     onSessionDelete,
     onProjectDelete,
+    onProjectHide,
     setCurrentProject,
     setSidebarVisible: (visible) => setPreference('sidebarVisible', visible),
     sidebarVisible,
@@ -135,12 +154,6 @@ function Sidebar({
 
     window.location.reload();
   };
-
-  const handleProjectHide = onProjectHide
-    ? (project: Project) => {
-        onProjectHide(project.name);
-      }
-    : () => undefined;
 
   const projectListProps: SidebarProjectListProps = {
     projects,
@@ -174,7 +187,9 @@ function Sidebar({
       void saveProjectName(projectName);
     },
     onDeleteProject: requestProjectDelete,
-    onHideProject: handleProjectHide,
+    onHideProject: (project) => {
+      void hideProjectFromSidebar(project);
+    },
     onSessionSelect: handleSessionClick,
     onDeleteSession: showDeleteSessionConfirmation,
     onLoadMoreSessions: (project) => {
@@ -210,13 +225,16 @@ function Sidebar({
         onCancelDeleteProject={() => setDeleteConfirmation(null)}
         onConfirmDeleteProject={confirmDeleteProject}
         sessionDeleteConfirmation={sessionDeleteConfirmation}
-        onCancelDeleteSession={() => setSessionDeleteConfirmation(null)}
-        onConfirmDeleteSession={confirmDeleteSession}
-        showHiddenProjects={false}
-        hiddenProjects={[]}
-        hiddenProjectNamesInFlight={new Set()}
-        onCloseHiddenProjects={() => undefined}
-        onRestoreHiddenProject={() => undefined}
+        isDeletingSession={isDeletingSession}
+        onCancelDeleteSession={onCancelDeleteSession}
+        onConfirmDeleteSession={onConfirmDeleteSession}
+        showHiddenProjects={showHiddenProjects}
+        hiddenProjects={hiddenProjects}
+        hiddenProjectNamesInFlight={hiddenProjectNamesInFlight}
+        onCloseHiddenProjects={() => setShowHiddenProjects(false)}
+        onRestoreHiddenProject={(projectName) => {
+          void restoreHiddenProject(projectName);
+        }}
         showVersionModal={showVersionModal}
         onCloseVersionModal={() => setShowVersionModal(false)}
         releaseInfo={releaseInfo}
@@ -252,23 +270,22 @@ function Sidebar({
             conversationResults={conversationResults}
             isSearching={isSearching}
             searchProgress={searchProgress}
-            onConversationResultClick={(projectName: string, sessionId: string, provider: string, messageTimestamp?: string | null, messageSnippet?: string | null) => {
-              const resolvedProvider = (provider || 'claude') as SessionProvider;
-              const safeProvider = (IS_CODEX_ONLY_HARDENED ? 'codex' : resolvedProvider) as SessionProvider;
-              const project = projects.find(p => p.name === projectName);
-              const searchTarget = { __searchTargetTimestamp: messageTimestamp || null, __searchTargetSnippet: messageSnippet || null };
+            onConversationResultClick={(projectName: string, sessionId: string, provider: string) => {
+              const safeProvider: SessionProvider = IS_CODEX_ONLY_HARDENED
+                ? 'codex'
+                : normalizeConversationSessionProvider(provider);
+              const project = projects.find((p) => p.name === projectName);
               const sessionObj = {
                 id: sessionId,
                 __provider: safeProvider,
                 __projectName: projectName,
-                ...searchTarget,
               };
               if (project) {
                 handleProjectSelect(project);
                 const sessions = getProjectSessions(project);
-                const existing = sessions.find(s => s.id === sessionId);
+                const existing = sessions.find((session) => session.id === sessionId);
                 if (existing) {
-                  handleSessionClick({ ...existing, ...searchTarget }, projectName);
+                  handleSessionClick(existing, projectName);
                 } else {
                   handleSessionClick(sessionObj, projectName);
                 }
@@ -281,8 +298,8 @@ function Sidebar({
             }}
             isRefreshing={isRefreshing}
             onCreateProject={() => setShowNewProject(true)}
-            hiddenProjectsCount={0}
-            onShowHiddenProjects={() => undefined}
+            hiddenProjectsCount={hiddenProjects.length}
+            onShowHiddenProjects={() => setShowHiddenProjects(true)}
             onCollapseSidebar={handleCollapseSidebar}
             updateAvailable={updateAvailable}
             releaseInfo={releaseInfo}

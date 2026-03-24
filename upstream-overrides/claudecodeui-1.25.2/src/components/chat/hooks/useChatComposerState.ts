@@ -10,7 +10,7 @@ import type {
   TouchEvent,
 } from 'react';
 import { useDropzone } from 'react-dropzone';
-import { authenticatedFetch } from '../../../utils/api';
+import { api, authenticatedFetch } from '../../../utils/api';
 import { IS_CODEX_ONLY_HARDENED } from '../../../constants/config';
 import { thinkingModes } from '../constants/thinkingModes';
 import { grantClaudeToolPermission } from '../utils/chatPermissions';
@@ -19,12 +19,18 @@ import {
   safeLocalStorage,
   type ChatDraftSnapshot,
 } from '../utils/chatStorage';
+import {
+  hasPendingTemplateSession,
+  resolvePendingViewSessionId,
+} from '../utils/pendingSession';
 import type {
+  ChatAttachment,
   ChatMessage,
   PendingPermissionRequest,
   PermissionMode,
 } from '../types/types';
 import type { Project, ProjectSession, SessionProvider } from '../../../types/app';
+import type { SessionViewChatRuntime } from '../../../types/sessionView';
 import { escapeRegExp } from '../utils/chatFormatting';
 import { useFileMentions } from './useFileMentions';
 import { type SlashCommand, useSlashCommands } from './useSlashCommands';
@@ -33,6 +39,16 @@ type PendingViewSession = {
   sessionId: string | null;
   startedAt: number;
 };
+
+interface QueuedCodexFollowUp {
+  queueId: string;
+  messageContent: string;
+  projectPath: string;
+  model: string;
+  permissionMode: PermissionMode | string;
+  modelReasoningEffort: string;
+  resumeSessionId: string | null;
+}
 
 interface UseChatComposerStateArgs {
   selectedProject: Project | null;
@@ -56,6 +72,11 @@ interface UseChatComposerStateArgs {
   onInputFocusChange?: (focused: boolean) => void;
   onFileOpen?: (filePath: string, diffInfo?: unknown) => void;
   onShowSettings?: () => void;
+  onCreateOptimisticSession?: (
+    project: Project,
+    session: ProjectSession,
+    initialChatRuntime?: Partial<SessionViewChatRuntime>,
+  ) => void;
   pendingViewSessionRef: { current: PendingViewSession | null };
   scrollToBottom: () => void;
   setChatMessages: Dispatch<SetStateAction<ChatMessage[]>>;
@@ -81,12 +102,83 @@ interface CommandExecutionResult {
   hasFileIncludes?: boolean;
 }
 
+const MAX_IMAGE_ATTACHMENTS = 5;
+const MAX_FILE_ATTACHMENTS = 10;
+const MAX_IMAGE_ATTACHMENT_BYTES = 5 * 1024 * 1024;
+const MAX_FILE_ATTACHMENT_BYTES = 20 * 1024 * 1024;
+
 const createFakeSubmitEvent = () => {
   return { preventDefault: () => undefined } as unknown as FormEvent<HTMLFormElement>;
 };
 
+const createQueuedCodexFollowUpId = () =>
+  `queued-codex-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+
 const isTemporarySessionId = (sessionId: string | null | undefined) =>
   Boolean(sessionId && sessionId.startsWith('new-session-'));
+
+const shouldLogNewSessionDebug = () => {
+  return false;
+};
+
+const logNewSessionDebug = (event: string, payload: Record<string, unknown>) => {
+  if (!shouldLogNewSessionDebug()) {
+    return;
+  }
+
+  console.debug('[new-session][composer]', {
+    event,
+    timestamp: new Date().toISOString(),
+    ...payload,
+  });
+};
+
+const isImageMimeType = (mimeType: string | null | undefined) =>
+  typeof mimeType === 'string' && mimeType.startsWith('image/');
+
+const getFileIdentity = (file: File) => `${file.name}::${file.size}::${file.lastModified}`;
+
+const dedupeFiles = (files: File[]) => {
+  const seen = new Set<string>();
+  return files.filter((file) => {
+    const identity = getFileIdentity(file);
+    if (seen.has(identity)) {
+      return false;
+    }
+    seen.add(identity);
+    return true;
+  });
+};
+
+const normalizeAttachmentPromptPath = (filePath: string) => filePath.replace(/\\/g, '/');
+
+const appendAttachmentContext = (messageContent: string, attachments: ChatAttachment[]) => {
+  if (!attachments.length) {
+    return messageContent;
+  }
+
+  const imageAttachments = attachments.filter((attachment) => attachment.kind === 'image');
+  const fileAttachments = attachments.filter((attachment) => attachment.kind === 'file');
+  const sections: string[] = [];
+
+  if (imageAttachments.length > 0) {
+    sections.push(
+      `\u5df2\u9644\u5e26\u56fe\u7247\uff1a${imageAttachments.map((attachment) => attachment.name).join('\u3001')}\u3002\u8bf7\u7ed3\u5408\u8fd9\u4e9b\u56fe\u7247\u4e00\u8d77\u5904\u7406\u3002`,
+    );
+  }
+
+  if (fileAttachments.length > 0) {
+    sections.push(
+      [
+        '\u5df2\u9644\u5e26\u672c\u5730\u9644\u4ef6\uff0c\u53ef\u76f4\u63a5\u8bfb\u53d6\u4ee5\u4e0b\u8def\u5f84\uff1a',
+        ...fileAttachments.map((attachment) => `- ${normalizeAttachmentPromptPath(attachment.path)}`),
+      ].join('\n'),
+    );
+  }
+
+  const attachmentContext = sections.join('\n\n');
+  return messageContent.trim() ? `${messageContent}\n\n${attachmentContext}` : attachmentContext;
+};
 
 const readDraftSnapshot = (storageKey: string | null): ChatDraftSnapshot | null => {
   if (!storageKey) {
@@ -134,6 +226,7 @@ export function useChatComposerState({
   onInputFocusChange,
   onFileOpen,
   onShowSettings,
+  onCreateOptimisticSession,
   pendingViewSessionRef,
   scrollToBottom,
   setChatMessages,
@@ -144,19 +237,55 @@ export function useChatComposerState({
   setIsUserScrolledUp,
   setPendingPermissionRequests,
 }: UseChatComposerStateArgs) {
+  const resolveDraftScopedSessionId = () => {
+    const pendingSessionId =
+      typeof window !== 'undefined' ? sessionStorage.getItem('pendingSessionId') : null;
+    const cursorSessionId =
+      typeof window !== 'undefined' ? sessionStorage.getItem('cursorSessionId') : null;
+    const pendingViewSessionId = resolvePendingViewSessionId(
+      pendingViewSessionRef.current,
+      pendingSessionId,
+    );
+
+    if (selectedSession?.id) {
+      return selectedSession.id;
+    }
+
+    if (pendingViewSessionId) {
+      return pendingViewSessionId;
+    }
+
+    if (pendingSessionId) {
+      return pendingSessionId;
+    }
+
+    if (provider === 'cursor' && cursorSessionId) {
+      return cursorSessionId;
+    }
+
+    if (currentSessionId && isTemporarySessionId(currentSessionId)) {
+      return currentSessionId;
+    }
+
+    return null;
+  };
+
   const draftStorageKey = getChatDraftStorageKey({
     projectName: selectedProject?.name,
-    sessionId: selectedSession?.id || currentSessionId,
+    sessionId: resolveDraftScopedSessionId(),
     provider: selectedSession?.__provider || provider,
   });
   const initialDraftSnapshot =
     typeof window !== 'undefined' ? readDraftSnapshot(draftStorageKey) : null;
   const [input, setInput] = useState(() => initialDraftSnapshot?.input || '');
   const [attachedImages, setAttachedImages] = useState<File[]>([]);
+  const [attachedFiles, setAttachedFiles] = useState<File[]>([]);
   const [uploadingImages, setUploadingImages] = useState<Map<string, number>>(new Map());
   const [imageErrors, setImageErrors] = useState<Map<string, string>>(new Map());
+  const [fileErrors, setFileErrors] = useState<Map<string, string>>(new Map());
   const [isTextareaExpanded, setIsTextareaExpanded] = useState(false);
   const [thinkingMode, setThinkingMode] = useState(() => initialDraftSnapshot?.thinkingMode || 'none');
+  const [queuedCodexFollowUpCount, setQueuedCodexFollowUpCount] = useState(0);
 
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const inputHighlightRef = useRef<HTMLDivElement>(null);
@@ -164,6 +293,44 @@ export function useChatComposerState({
     ((event: FormEvent<HTMLFormElement> | MouseEvent | TouchEvent | KeyboardEvent<HTMLTextAreaElement>) => Promise<void>) | null
   >(null);
   const inputValueRef = useRef(input);
+  const queuedCodexFollowUpsRef = useRef<QueuedCodexFollowUp[]>([]);
+  const isDispatchingQueuedCodexFollowUpRef = useRef(false);
+
+  const syncQueuedCodexFollowUpCount = useCallback(() => {
+    setQueuedCodexFollowUpCount(queuedCodexFollowUpsRef.current.length);
+  }, []);
+
+  const getConcreteSessionIdCandidates = useCallback(() => {
+    const pendingSessionId =
+      typeof window !== 'undefined' ? sessionStorage.getItem('pendingSessionId') : null;
+    const cursorSessionId =
+      typeof window !== 'undefined' ? sessionStorage.getItem('cursorSessionId') : null;
+    const pendingViewSessionId = resolvePendingViewSessionId(
+      pendingViewSessionRef.current,
+      pendingSessionId,
+    );
+    const allowCurrentSessionIdReuse =
+      Boolean(selectedSession?.id) ||
+      hasPendingTemplateSession(pendingViewSessionRef.current, pendingSessionId) ||
+      Boolean(currentSessionId && isTemporarySessionId(currentSessionId));
+
+    return [
+      allowCurrentSessionIdReuse ? currentSessionId : null,
+      pendingViewSessionId,
+      pendingSessionId,
+      provider === 'cursor' ? cursorSessionId : null,
+      selectedSession?.id || null,
+    ];
+  }, [currentSessionId, pendingViewSessionRef, provider, selectedSession?.id]);
+
+  const resolveConcreteSessionId = useCallback(() => {
+    const candidateSessionIds = getConcreteSessionIdCandidates();
+    return (
+      candidateSessionIds.find(
+        (sessionId) => Boolean(sessionId) && !isTemporarySessionId(sessionId),
+      ) || null
+    );
+  }, [getConcreteSessionIdCandidates]);
 
   const handleBuiltInCommand = useCallback(
     (result: CommandExecutionResult) => {
@@ -213,14 +380,13 @@ export function useChatComposerState({
           ]);
           break;
         }
-
         case 'memory':
           if (data.error) {
             setChatMessages((previous) => [
               ...previous,
               {
                 type: 'assistant',
-                content: `⚠️ ${data.message}`,
+                content: `\u5185\u5b58\u547d\u4ee4\u6267\u884c\u5931\u8d25\uff1a${data.message}`,
                 timestamp: Date.now(),
               },
             ]);
@@ -229,7 +395,7 @@ export function useChatComposerState({
               ...previous,
               {
                 type: 'assistant',
-                content: `📝 ${data.message}\n\nPath: \`${data.path}\``,
+                content: `\u5185\u5b58\u547d\u4ee4\u6267\u884c\u6210\u529f\uff1a${data.message}\n\nPath: \`${data.path}\``,
                 timestamp: Date.now(),
               },
             ]);
@@ -242,14 +408,13 @@ export function useChatComposerState({
         case 'config':
           onShowSettings?.();
           break;
-
         case 'rewind':
           if (data.error) {
             setChatMessages((previous) => [
               ...previous,
               {
                 type: 'assistant',
-                content: `⚠️ ${data.message}`,
+                content: `\u56de\u6eda\u547d\u4ee4\u6267\u884c\u5931\u8d25\uff1a${data.message}`,
                 timestamp: Date.now(),
               },
             ]);
@@ -259,7 +424,7 @@ export function useChatComposerState({
               ...previous,
               {
                 type: 'assistant',
-                content: `⏪ ${data.message}`,
+                content: `\u5df2\u56de\u6eda\uff1a${data.message}`,
                 timestamp: Date.now(),
               },
             ]);
@@ -278,14 +443,14 @@ export function useChatComposerState({
 
     if (hasBashCommands) {
       const confirmed = window.confirm(
-        'This command contains bash commands that will be executed. Do you want to proceed?',
+        '\u8fd9\u4e2a\u547d\u4ee4\u5305\u542b\u5c06\u8981\u6267\u884c\u7684 bash \u547d\u4ee4\uff0c\u662f\u5426\u7ee7\u7eed\uff1f',
       );
       if (!confirmed) {
         setChatMessages((previous) => [
           ...previous,
           {
             type: 'assistant',
-            content: '❌ Command execution cancelled',
+            content: '\u5df2\u53d6\u6d88\u6267\u884c\u547d\u4ee4\u3002',
             timestamp: Date.now(),
           },
         ]);
@@ -365,7 +530,7 @@ export function useChatComposerState({
           ...previous,
           {
             type: 'assistant',
-            content: `Error executing command: ${message}`,
+            content: `\u6267\u884c\u547d\u4ee4\u5931\u8d25\uff1a${message}`,
             timestamp: Date.now(),
           },
         ]);
@@ -431,162 +596,156 @@ export function useChatComposerState({
     inputHighlightRef.current.scrollLeft = target.scrollLeft;
   }, []);
 
-  const handleImageFiles = useCallback((files: File[]) => {
-    if (IS_CODEX_ONLY_HARDENED) {
-      return;
-    }
-
-    const validFiles = files.filter((file) => {
-      try {
-        if (!file || typeof file !== 'object') {
-          console.warn('Invalid file object:', file);
-          return false;
-        }
-
-        if (!file.type || !file.type.startsWith('image/')) {
-          return false;
-        }
-
-        if (!file.size || file.size > 5 * 1024 * 1024) {
-          const fileName = file.name || 'Unknown file';
-          setImageErrors((previous) => {
-            const next = new Map(previous);
-            next.set(fileName, 'File too large (max 5MB)');
-            return next;
-          });
-          return false;
-        }
-
-        return true;
-      } catch (error) {
-        console.error('Error validating file:', error, file);
-        return false;
-      }
+  const pushImageError = useCallback((fileName: string, message: string) => {
+    setImageErrors((previous) => {
+      const next = new Map(previous);
+      next.set(fileName, message);
+      return next;
     });
-
-    if (validFiles.length > 0) {
-      setAttachedImages((previous) => [...previous, ...validFiles].slice(0, 5));
-    }
   }, []);
 
-  const handlePaste = useCallback(
-    (event: ClipboardEvent<HTMLTextAreaElement>) => {
-      const items = Array.from(event.clipboardData.items);
+  const pushFileError = useCallback((fileName: string, message: string) => {
+    setFileErrors((previous) => {
+      const next = new Map(previous);
+      next.set(fileName, message);
+      return next;
+    });
+  }, []);
 
-      items.forEach((item) => {
-        if (!item.type.startsWith('image/')) {
-          return;
-        }
-        const file = item.getAsFile();
-        if (file) {
-          handleImageFiles([file]);
+  const handleSelectedFiles = useCallback(
+    (files: File[]) => {
+      const validImages: File[] = [];
+      const validFiles: File[] = [];
+
+      files.forEach((file) => {
+        try {
+          if (!file || typeof file !== 'object') {
+            console.warn('Invalid file object:', file);
+            return;
+          }
+
+          const fileName = file.name || 'Unknown file';
+          if (!file.size) {
+            if (isImageMimeType(file.type)) {
+              pushImageError(fileName, '\u56fe\u7247\u4e3a\u7a7a\uff0c\u8bf7\u91cd\u65b0\u590d\u5236\u6216\u9009\u62e9\u6587\u4ef6\u3002');
+            } else {
+              pushFileError(fileName, '\u9644\u4ef6\u4e3a\u7a7a\uff0c\u8bf7\u91cd\u65b0\u590d\u5236\u6216\u9009\u62e9\u6587\u4ef6\u3002');
+            }
+            return;
+          }
+
+          if (isImageMimeType(file.type)) {
+            if (provider !== 'codex' && IS_CODEX_ONLY_HARDENED) {
+              pushImageError(fileName, '\u5f53\u524d\u53ea\u6709 Codex \u4f1a\u8bdd\u652f\u6301\u56fe\u7247\u4e0a\u4f20\uff0c\u8bf7\u5207\u6362\u5230 Codex \u540e\u518d\u53d1\u9001\u3002');
+              return;
+            }
+
+            if (file.size > MAX_IMAGE_ATTACHMENT_BYTES) {
+              pushImageError(fileName, '\u56fe\u7247\u4f53\u79ef\u4e0d\u80fd\u8d85\u8fc7 5MB\u3002');
+              return;
+            }
+
+            validImages.push(file);
+            return;
+          }
+
+          if (provider !== 'codex') {
+            pushFileError(fileName, '\u5f53\u524d\u53ea\u6709 Codex \u4f1a\u8bdd\u652f\u6301\u666e\u901a\u9644\u4ef6\uff0c\u8bf7\u5207\u6362\u5230 Codex \u540e\u518d\u53d1\u9001\u3002');
+            return;
+          }
+
+          if (file.size > MAX_FILE_ATTACHMENT_BYTES) {
+            pushFileError(fileName, '\u9644\u4ef6\u4f53\u79ef\u4e0d\u80fd\u8d85\u8fc7 20MB\u3002');
+            return;
+          }
+
+          validFiles.push(file);
+        } catch (error) {
+          console.error('Error validating selected file:', error, file);
         }
       });
 
-      if (items.length === 0 && event.clipboardData.files.length > 0) {
-        const files = Array.from(event.clipboardData.files);
-        const imageFiles = files.filter((file) => file.type.startsWith('image/'));
-        if (imageFiles.length > 0) {
-          handleImageFiles(imageFiles);
-        }
+      if (validImages.length > 0) {
+        setAttachedImages((previous) =>
+          dedupeFiles([...previous, ...validImages]).slice(0, MAX_IMAGE_ATTACHMENTS),
+        );
+        setImageErrors((previous) => {
+          const next = new Map(previous);
+          validImages.forEach((file) => next.delete(file.name));
+          return next;
+        });
+      }
+
+      if (validFiles.length > 0) {
+        setAttachedFiles((previous) =>
+          dedupeFiles([...previous, ...validFiles]).slice(0, MAX_FILE_ATTACHMENTS),
+        );
+        setFileErrors((previous) => {
+          const next = new Map(previous);
+          validFiles.forEach((file) => next.delete(file.name));
+          return next;
+        });
       }
     },
-    [handleImageFiles],
+    [provider, pushFileError, pushImageError],
+  );
+
+  const handlePaste = useCallback(
+    (event: ClipboardEvent<HTMLTextAreaElement>) => {
+      const clipboardFiles = Array.from(event.clipboardData.files || []);
+      if (clipboardFiles.length > 0) {
+        event.preventDefault();
+        handleSelectedFiles(clipboardFiles);
+        return;
+      }
+
+      const pastedFiles = Array.from(event.clipboardData.items)
+        .map((item) => item.getAsFile())
+        .filter((file): file is File => file instanceof File);
+
+      if (pastedFiles.length > 0) {
+        event.preventDefault();
+        handleSelectedFiles(pastedFiles);
+      }
+    },
+    [handleSelectedFiles],
   );
 
   const { getRootProps, getInputProps, isDragActive, open } = useDropzone({
-    accept: {
-      'image/*': ['.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg'],
-    },
-    maxSize: 5 * 1024 * 1024,
-    maxFiles: 5,
-    onDrop: handleImageFiles,
+    maxFiles: MAX_IMAGE_ATTACHMENTS + MAX_FILE_ATTACHMENTS,
+    onDrop: handleSelectedFiles,
     noClick: true,
     noKeyboard: true,
   });
 
-  const handleSubmit = useCallback(
-    async (
-      event: FormEvent<HTMLFormElement> | MouseEvent | TouchEvent | KeyboardEvent<HTMLTextAreaElement>,
+  const resetComposerAfterSubmit = useCallback(() => {
+    setInput('');
+    inputValueRef.current = '';
+    resetCommandMenuState();
+    setAttachedImages([]);
+    setAttachedFiles([]);
+    setUploadingImages(new Map());
+    setImageErrors(new Map());
+    setFileErrors(new Map());
+    setIsTextareaExpanded(false);
+    setThinkingMode('none');
+
+    if (textareaRef.current) {
+      textareaRef.current.style.height = 'auto';
+    }
+
+    if (draftStorageKey) {
+      safeLocalStorage.removeItem(draftStorageKey);
+    }
+  }, [draftStorageKey, resetCommandMenuState]);
+
+  const markSessionSubmissionStarted = useCallback(
+    (
+      effectiveSessionId: string | null,
+      sessionToActivate: string,
+      submissionStartedAt = Date.now(),
     ) => {
-      event.preventDefault();
-      const currentInput = inputValueRef.current;
-      if (!currentInput.trim() || isLoading || !selectedProject) {
-        return;
-      }
-
-      // Intercept slash commands: if input starts with /commandName, execute as command with args
-      const trimmedInput = currentInput.trim();
-      if (trimmedInput.startsWith('/')) {
-        const firstSpace = trimmedInput.indexOf(' ');
-        const commandName = firstSpace > 0 ? trimmedInput.slice(0, firstSpace) : trimmedInput;
-        const matchedCommand = slashCommands.find((cmd: SlashCommand) => cmd.name === commandName);
-        if (matchedCommand) {
-          executeCommand(matchedCommand, trimmedInput);
-          setInput('');
-          inputValueRef.current = '';
-          setAttachedImages([]);
-          setUploadingImages(new Map());
-          setImageErrors(new Map());
-          resetCommandMenuState();
-          setIsTextareaExpanded(false);
-          if (textareaRef.current) {
-            textareaRef.current.style.height = 'auto';
-          }
-          return;
-        }
-      }
-
-      let messageContent = currentInput;
-      const selectedThinkingMode = thinkingModes.find((mode: { id: string; prefix?: string }) => mode.id === thinkingMode);
-      if (selectedThinkingMode && selectedThinkingMode.prefix) {
-        messageContent = `${selectedThinkingMode.prefix}: ${currentInput}`;
-      }
-
-      let uploadedImages: unknown[] = [];
-      if (!IS_CODEX_ONLY_HARDENED && attachedImages.length > 0) {
-        const formData = new FormData();
-        attachedImages.forEach((file) => {
-          formData.append('images', file);
-        });
-
-        try {
-          const response = await authenticatedFetch(`/api/projects/${selectedProject.name}/upload-images`, {
-            method: 'POST',
-            headers: {},
-            body: formData,
-          });
-
-          if (!response.ok) {
-            throw new Error('Failed to upload images');
-          }
-
-          const result = await response.json();
-          uploadedImages = result.images;
-        } catch (error) {
-          const message = error instanceof Error ? error.message : 'Unknown error';
-          console.error('Image upload failed:', error);
-          setChatMessages((previous) => [
-            ...previous,
-            {
-              type: 'error',
-              content: `Failed to upload images: ${message}`,
-              timestamp: new Date(),
-            },
-          ]);
-          return;
-        }
-      }
-
-      const userMessage: ChatMessage = {
-        type: 'user',
-        content: currentInput,
-        images: uploadedImages as any,
-        timestamp: new Date(),
-      };
-
-      setChatMessages((previous) => [...previous, userMessage]);
-      setIsLoading(true); // Processing banner starts
+      setIsLoading(true);
       setCanAbortSession(true);
       setClaudeStatus({
         text: 'Processing',
@@ -597,21 +756,355 @@ export function useChatComposerState({
       setIsUserScrolledUp(false);
       setTimeout(() => scrollToBottom(), 100);
 
-      const effectiveSessionId =
-        currentSessionId || selectedSession?.id || sessionStorage.getItem('cursorSessionId');
-      const sessionToActivate = effectiveSessionId || `new-session-${Date.now()}`;
-
-      if (!effectiveSessionId && !selectedSession?.id) {
+      if (
+        !effectiveSessionId &&
+        !selectedSession?.id &&
+        !pendingViewSessionRef.current?.sessionId
+      ) {
         if (typeof window !== 'undefined') {
-          // Reset stale pending IDs from previous interrupted runs before creating a new one.
           sessionStorage.removeItem('pendingSessionId');
         }
-        pendingViewSessionRef.current = { sessionId: null, startedAt: Date.now() };
+        pendingViewSessionRef.current = {
+          sessionId: null,
+          startedAt: submissionStartedAt,
+        };
       }
+
       onSessionActive?.(sessionToActivate);
       if (effectiveSessionId && !isTemporarySessionId(effectiveSessionId)) {
         onSessionProcessing?.(effectiveSessionId);
       }
+    },
+    [
+      onSessionActive,
+      onSessionProcessing,
+      pendingViewSessionRef,
+      scrollToBottom,
+      selectedSession?.id,
+      setCanAbortSession,
+      setClaudeStatus,
+      setIsLoading,
+      setIsUserScrolledUp,
+    ],
+  );
+
+  const markQueuedCodexMessageAsDispatched = useCallback(
+    (queueId: string) => {
+      setChatMessages((previous) =>
+        previous.map((message) => {
+          if (
+            message.type === 'user' &&
+            Boolean(message.isQueued) &&
+            message.queuedFollowUpId === queueId
+          ) {
+            return {
+              ...message,
+              isQueued: false,
+              queuedWhileStreaming: false,
+            };
+          }
+
+          return message;
+        }),
+      );
+    },
+    [setChatMessages],
+  );
+
+  const handleRemoveQueuedCodexFollowUp = useCallback(
+    (queueId: string) => {
+      queuedCodexFollowUpsRef.current = queuedCodexFollowUpsRef.current.filter(
+        (followUp) => followUp.queueId !== queueId,
+      );
+      syncQueuedCodexFollowUpCount();
+
+      setChatMessages((previous) =>
+        previous.filter(
+          (message) =>
+            !(
+              message.type === 'user' &&
+              Boolean(message.isQueued) &&
+              message.queuedFollowUpId === queueId
+            ),
+        ),
+      );
+    },
+    [setChatMessages, syncQueuedCodexFollowUpCount],
+  );
+
+  const handleSubmit = useCallback(
+    async (
+      event: FormEvent<HTMLFormElement> | MouseEvent | TouchEvent | KeyboardEvent<HTMLTextAreaElement>,
+    ) => {
+      event.preventDefault();
+      const currentInput = inputValueRef.current;
+      const hasAttachments = attachedImages.length > 0 || attachedFiles.length > 0;
+
+      if ((!currentInput.trim() && !hasAttachments) || !selectedProject) {
+        return;
+      }
+
+      if (isLoading) {
+        if (provider !== 'codex') {
+          return;
+        }
+
+        if (hasAttachments) {
+          setChatMessages((previous) => [
+            ...previous,
+            {
+              type: 'error',
+              content: '\u5f53\u524d\u56de\u7b54\u8fd8\u5728\u5904\u7406\u4e2d\uff0c\u56fe\u7247\u548c\u9644\u4ef6\u8bf7\u7b49\u672c\u8f6e\u7ed3\u675f\u540e\u518d\u53d1\u9001\u3002',
+              timestamp: new Date(),
+            },
+          ]);
+          return;
+        }
+
+        const selectedThinkingMode = thinkingModes.find(
+          (mode: { id: string; prefix?: string }) => mode.id === thinkingMode,
+        );
+        const queuedMessageContent =
+          selectedThinkingMode && selectedThinkingMode.prefix
+            ? `${selectedThinkingMode.prefix}: ${currentInput}`
+            : currentInput;
+        const queueId = createQueuedCodexFollowUpId();
+
+        queuedCodexFollowUpsRef.current.push({
+          queueId,
+          messageContent: queuedMessageContent,
+          projectPath: selectedProject.fullPath || selectedProject.path || '',
+          model: codexModel,
+          permissionMode,
+          modelReasoningEffort: codexReasoningEffort,
+          resumeSessionId: resolveConcreteSessionId(),
+        });
+        syncQueuedCodexFollowUpCount();
+
+        setChatMessages((previous) => [
+          ...previous,
+          {
+            type: 'user',
+            content: currentInput,
+            timestamp: new Date(),
+            isQueued: true,
+            queuedWhileStreaming: true,
+            queuedFollowUpId: queueId,
+          },
+        ]);
+
+        resetComposerAfterSubmit();
+        return;
+      }
+
+      const trimmedInput = currentInput.trim();
+      if (trimmedInput.startsWith('/') && !hasAttachments) {
+        const firstSpace = trimmedInput.indexOf(' ');
+        const commandName = firstSpace > 0 ? trimmedInput.slice(0, firstSpace) : trimmedInput;
+        const matchedCommand = slashCommands.find((cmd: SlashCommand) => cmd.name === commandName);
+        if (matchedCommand) {
+          executeCommand(matchedCommand, trimmedInput);
+          setInput('');
+          inputValueRef.current = '';
+          setAttachedImages([]);
+          setAttachedFiles([]);
+          setUploadingImages(new Map());
+          setImageErrors(new Map());
+          setFileErrors(new Map());
+          resetCommandMenuState();
+          setIsTextareaExpanded(false);
+          if (textareaRef.current) {
+            textareaRef.current.style.height = 'auto';
+          }
+          return;
+        }
+      }
+
+      let commandContent = currentInput;
+      const selectedThinkingMode = thinkingModes.find(
+        (mode: { id: string; prefix?: string }) => mode.id === thinkingMode,
+      );
+      if (selectedThinkingMode && selectedThinkingMode.prefix) {
+        commandContent = `${selectedThinkingMode.prefix}: ${currentInput}`;
+      }
+
+      let displayContent = currentInput;
+      let uploadedImages: unknown[] = [];
+      let uploadedAttachments: ChatAttachment[] = [];
+
+      if (provider === 'codex' && hasAttachments) {
+        const formData = new FormData();
+        [...attachedImages, ...attachedFiles].forEach((file) => {
+          formData.append('files', file, file.name);
+        });
+
+        try {
+          const response = await api.uploadChatAttachments(selectedProject.name, formData);
+          if (!response.ok) {
+            let errorMessage = '\u9644\u4ef6\u4e0a\u4f20\u5931\u8d25';
+            try {
+              const errorData = await response.json();
+              errorMessage = errorData?.error || errorMessage;
+            } catch {
+              // Ignore response parse failures and use the fallback message.
+            }
+            throw new Error(errorMessage);
+          }
+
+          const result = (await response.json()) as { attachments?: ChatAttachment[] };
+          uploadedAttachments = Array.isArray(result.attachments) ? result.attachments : [];
+          commandContent = appendAttachmentContext(commandContent, uploadedAttachments);
+          displayContent = appendAttachmentContext(displayContent, uploadedAttachments);
+        } catch (error) {
+          const message = error instanceof Error ? error.message : 'Unknown error';
+          console.error('Attachment upload failed:', error);
+          setChatMessages((previous) => [
+            ...previous,
+            {
+              type: 'error',
+              content: `\u9644\u4ef6\u4e0a\u4f20\u5931\u8d25\uff1a${message}`,
+              timestamp: new Date(),
+            },
+          ]);
+          return;
+        }
+      } else {
+        if (IS_CODEX_ONLY_HARDENED && attachedImages.length > 0) {
+          setChatMessages((previous) => [
+            ...previous,
+            {
+              type: 'error',
+              content: '\u5f53\u524d\u53ea\u6709 Codex \u4f1a\u8bdd\u652f\u6301\u56fe\u7247\u4e0a\u4f20\uff0c\u8bf7\u5207\u5230 Codex \u4f1a\u8bdd\u540e\u518d\u53d1\u9001\u3002',
+              timestamp: new Date(),
+            },
+          ]);
+          return;
+        }
+
+        if (attachedFiles.length > 0) {
+          setChatMessages((previous) => [
+            ...previous,
+            {
+              type: 'error',
+              content: '\u5f53\u524d provider \u6682\u4e0d\u652f\u6301\u666e\u901a\u9644\u4ef6\uff0c\u8bf7\u5207\u5230 Codex \u4f1a\u8bdd\u540e\u518d\u53d1\u9001\u3002',
+              timestamp: new Date(),
+            },
+          ]);
+          return;
+        }
+
+        if (!IS_CODEX_ONLY_HARDENED && attachedImages.length > 0) {
+          const formData = new FormData();
+          attachedImages.forEach((file) => {
+            formData.append('images', file);
+          });
+
+          try {
+            const response = await authenticatedFetch(`/api/projects/${selectedProject.name}/upload-images`, {
+              method: 'POST',
+              headers: {},
+              body: formData,
+            });
+
+            if (!response.ok) {
+              throw new Error('\u56fe\u7247\u4e0a\u4f20\u5931\u8d25');
+            }
+
+            const result = await response.json();
+            uploadedImages = result.images;
+            if (!displayContent.trim()) {
+              displayContent = `\u5df2\u9644\u5e26\u56fe\u7247\uff1a${attachedImages.map((file) => file.name).join('\u3001')}`;
+            }
+          } catch (error) {
+            const message = error instanceof Error ? error.message : 'Unknown error';
+            console.error('Image upload failed:', error);
+            setChatMessages((previous) => [
+              ...previous,
+              {
+                type: 'error',
+                content: `\u56fe\u7247\u4e0a\u4f20\u5931\u8d25\uff1a${message}`,
+                timestamp: new Date(),
+              },
+            ]);
+            return;
+          }
+        }
+      }
+
+      const userMessage: ChatMessage = {
+        type: 'user',
+        content: displayContent.trim() ? displayContent : commandContent,
+        images: uploadedImages as any,
+        attachments: uploadedAttachments,
+        timestamp: new Date(),
+      };
+
+      setChatMessages((previous) => [...previous, userMessage]);
+      const effectiveSessionId = resolveConcreteSessionId();
+      const shouldCreateOptimisticSession =
+        provider === 'codex' &&
+        !effectiveSessionId &&
+        !selectedSession?.id;
+      const optimisticSessionId = shouldCreateOptimisticSession ? `new-session-${Date.now()}` : null;
+      const sessionToActivate = effectiveSessionId || optimisticSessionId || `new-session-${Date.now()}`;
+      const submissionStartedAt = Date.now();
+      const initialOptimisticChatRuntime: Partial<SessionViewChatRuntime> = {
+        isLoading: true,
+        canAbortSession: true,
+        claudeStatus: {
+          text: 'Processing',
+          tokens: 0,
+          can_interrupt: true,
+        },
+        tokenBudget: null,
+        pendingPermissionRequests: [],
+        startedAt: submissionStartedAt,
+        updatedAt: submissionStartedAt,
+      };
+      logNewSessionDebug('submit-resolved-session', {
+        provider,
+        selectedProjectName: selectedProject.name,
+        selectedSessionId: selectedSession?.id || null,
+        currentSessionId,
+        effectiveSessionId,
+        shouldCreateOptimisticSession,
+        optimisticSessionId,
+        sessionToActivate,
+      });
+
+      if (!effectiveSessionId && !selectedSession?.id) {
+        if (typeof window !== 'undefined') {
+          sessionStorage.removeItem('pendingSessionId');
+        }
+        pendingViewSessionRef.current = {
+          sessionId: optimisticSessionId,
+          startedAt: submissionStartedAt,
+        };
+      }
+
+      if (shouldCreateOptimisticSession && optimisticSessionId) {
+        const trimmedTitle = currentInput.trim();
+        const optimisticTimestamp = new Date().toISOString();
+        logNewSessionDebug('submit-create-optimistic-session', {
+          optimisticSessionId,
+          title: trimmedTitle || '\u65b0\u4f1a\u8bdd',
+        });
+
+        onCreateOptimisticSession?.(
+          selectedProject,
+          {
+            id: optimisticSessionId,
+            title: trimmedTitle || '\u65b0\u4f1a\u8bdd',
+            summary: trimmedTitle || '\u65b0\u4f1a\u8bdd',
+            created_at: optimisticTimestamp,
+            updated_at: optimisticTimestamp,
+            __provider: 'codex',
+            __projectName: selectedProject.name,
+          },
+          initialOptimisticChatRuntime,
+        );
+      }
+      markSessionSubmissionStarted(effectiveSessionId, sessionToActivate, submissionStartedAt);
 
       const getToolsSettings = () => {
         try {
@@ -644,7 +1137,7 @@ export function useChatComposerState({
       if (provider === 'cursor') {
         sendMessage({
           type: 'cursor-command',
-          command: messageContent,
+          command: commandContent,
           sessionId: effectiveSessionId,
           options: {
             cwd: resolvedProjectPath,
@@ -657,9 +1150,16 @@ export function useChatComposerState({
           },
         });
       } else if (provider === 'codex') {
+        logNewSessionDebug('submit-send-codex-command', {
+          effectiveSessionId,
+          optimisticSessionId,
+          resolvedProjectPath,
+          permissionMode,
+          model: codexModel,
+        });
         sendMessage({
           type: 'codex-command',
-          command: messageContent,
+          command: commandContent,
           sessionId: effectiveSessionId,
           options: {
             cwd: resolvedProjectPath,
@@ -669,12 +1169,13 @@ export function useChatComposerState({
             model: codexModel,
             permissionMode,
             modelReasoningEffort: codexReasoningEffort,
+            attachments: uploadedAttachments,
           },
         });
       } else if (provider === 'gemini') {
         sendMessage({
           type: 'gemini-command',
-          command: messageContent,
+          command: commandContent,
           sessionId: effectiveSessionId,
           options: {
             cwd: resolvedProjectPath,
@@ -689,7 +1190,7 @@ export function useChatComposerState({
       } else {
         sendMessage({
           type: 'claude-command',
-          command: messageContent,
+          command: commandContent,
           options: {
             projectPath: resolvedProjectPath,
             cwd: resolvedProjectPath,
@@ -703,52 +1204,110 @@ export function useChatComposerState({
         });
       }
 
-      setInput('');
-      inputValueRef.current = '';
-      resetCommandMenuState();
-      setAttachedImages([]);
-      setUploadingImages(new Map());
-      setImageErrors(new Map());
-      setIsTextareaExpanded(false);
-      setThinkingMode('none');
-
-      if (textareaRef.current) {
-        textareaRef.current.style.height = 'auto';
-      }
-
-      if (draftStorageKey) {
-        safeLocalStorage.removeItem(draftStorageKey);
-      }
+      resetComposerAfterSubmit();
     },
     [
+      attachedFiles,
       attachedImages,
       claudeModel,
       codexModel,
+      codexReasoningEffort,
       currentSessionId,
       cursorModel,
       executeCommand,
       geminiModel,
       isLoading,
-      onSessionActive,
-      onSessionProcessing,
+      markSessionSubmissionStarted,
+      onCreateOptimisticSession,
       pendingViewSessionRef,
       permissionMode,
       provider,
+      resetComposerAfterSubmit,
+      resolveConcreteSessionId,
       resetCommandMenuState,
-      scrollToBottom,
       selectedProject,
       selectedSession?.id,
       sendMessage,
-      setCanAbortSession,
       setChatMessages,
-      setClaudeStatus,
-      setIsLoading,
-      setIsUserScrolledUp,
       slashCommands,
-      draftStorageKey,
+      syncQueuedCodexFollowUpCount,
       thinkingMode,
     ],
   );
+  useEffect(() => {
+    if (provider !== 'codex') {
+      return;
+    }
+
+    const activeQueuedFollowUps = queuedCodexFollowUpsRef.current;
+    if (activeQueuedFollowUps.length === 0) {
+      if (queuedCodexFollowUpCount !== 0) {
+        setQueuedCodexFollowUpCount(0);
+      }
+      return;
+    }
+
+    const resumeSessionId = resolveConcreteSessionId();
+
+    if (isLoading) {
+      if (resumeSessionId) {
+        activeQueuedFollowUps.forEach((followUp) => {
+          if (!followUp.resumeSessionId) {
+            followUp.resumeSessionId = resumeSessionId;
+          }
+        });
+      }
+      return;
+    }
+
+    if (isDispatchingQueuedCodexFollowUpRef.current) {
+      return;
+    }
+
+    const nextFollowUp = activeQueuedFollowUps[0];
+    if (!nextFollowUp) {
+      return;
+    }
+
+    const effectiveSessionId = nextFollowUp.resumeSessionId || resolveConcreteSessionId();
+    if (!effectiveSessionId) {
+      return;
+    }
+
+    activeQueuedFollowUps.shift();
+    syncQueuedCodexFollowUpCount();
+    isDispatchingQueuedCodexFollowUpRef.current = true;
+
+    markQueuedCodexMessageAsDispatched(nextFollowUp.queueId);
+    markSessionSubmissionStarted(effectiveSessionId, effectiveSessionId);
+    sendMessage({
+      type: 'codex-command',
+      command: nextFollowUp.messageContent,
+      sessionId: effectiveSessionId,
+      options: {
+        cwd: nextFollowUp.projectPath,
+        projectPath: nextFollowUp.projectPath,
+        sessionId: effectiveSessionId,
+        resume: true,
+        model: nextFollowUp.model,
+        permissionMode: nextFollowUp.permissionMode,
+        modelReasoningEffort: nextFollowUp.modelReasoningEffort,
+      },
+    });
+
+    window.setTimeout(() => {
+      isDispatchingQueuedCodexFollowUpRef.current = false;
+    }, 0);
+  }, [
+    isLoading,
+    markQueuedCodexMessageAsDispatched,
+    markSessionSubmissionStarted,
+    provider,
+    queuedCodexFollowUpCount,
+    resolveConcreteSessionId,
+    sendMessage,
+    syncQueuedCodexFollowUpCount,
+  ]);
 
   useEffect(() => {
     handleSubmitRef.current = handleSubmit;
@@ -770,8 +1329,10 @@ export function useChatComposerState({
     });
     setThinkingMode((previous) => (previous === nextThinkingMode ? previous : nextThinkingMode));
     setAttachedImages([]);
+    setAttachedFiles([]);
     setUploadingImages(new Map());
     setImageErrors(new Map());
+    setFileErrors(new Map());
   }, [draftStorageKey]);
 
   useEffect(() => {
@@ -894,49 +1455,13 @@ export function useChatComposerState({
     [setCursorPosition, syncInputOverlayScroll],
   );
 
-  const insertTextAtCursor = useCallback(
-    (textToInsert: string) => {
-      const textarea = textareaRef.current;
-      const currentValue = inputValueRef.current;
-      const selectionStart = textarea?.selectionStart ?? currentValue.length;
-      const selectionEnd = textarea?.selectionEnd ?? currentValue.length;
-      const nextValue =
-        currentValue.slice(0, selectionStart) +
-        textToInsert +
-        currentValue.slice(selectionEnd);
-
-      setInput(nextValue);
-      inputValueRef.current = nextValue;
-
-      window.setTimeout(() => {
-        if (!textareaRef.current) {
-          return;
-        }
-
-        const nextCursorPosition = selectionStart + textToInsert.length;
-        textareaRef.current.focus();
-        textareaRef.current.selectionStart = nextCursorPosition;
-        textareaRef.current.selectionEnd = nextCursorPosition;
-        textareaRef.current.style.height = 'auto';
-        textareaRef.current.style.height = `${textareaRef.current.scrollHeight}px`;
-        syncInputOverlayScroll(textareaRef.current);
-        setCursorPosition(nextCursorPosition);
-
-        const lineHeight = parseInt(window.getComputedStyle(textareaRef.current).lineHeight);
-        setIsTextareaExpanded(textareaRef.current.scrollHeight > lineHeight * 2);
-      }, 0);
-    },
-    [setCursorPosition, syncInputOverlayScroll],
-  );
-
-  const handleInsertSupplementBlock = useCallback(() => {
-    const prefix = inputValueRef.current.trim().length > 0 ? '\n\n' : '';
-    insertTextAtCursor(`${prefix}补充信息：\n- `);
-  }, [insertTextAtCursor]);
-
   const handleClearInput = useCallback(() => {
     setInput('');
     inputValueRef.current = '';
+    setAttachedImages([]);
+    setAttachedFiles([]);
+    setImageErrors(new Map());
+    setFileErrors(new Map());
     resetCommandMenuState();
     if (textareaRef.current) {
       textareaRef.current.style.height = 'auto';
@@ -950,21 +1475,10 @@ export function useChatComposerState({
       return;
     }
 
-    const pendingSessionId =
-      typeof window !== 'undefined' ? sessionStorage.getItem('pendingSessionId') : null;
-    const cursorSessionId =
-      typeof window !== 'undefined' ? sessionStorage.getItem('cursorSessionId') : null;
-
-    const candidateSessionIds = [
-      currentSessionId,
-      pendingViewSessionRef.current?.sessionId || null,
-      pendingSessionId,
-      provider === 'cursor' ? cursorSessionId : null,
-      selectedSession?.id || null,
-    ];
-
     const targetSessionId =
-      candidateSessionIds.find((sessionId) => Boolean(sessionId) && !isTemporarySessionId(sessionId)) || null;
+      getConcreteSessionIdCandidates().find(
+        (sessionId) => Boolean(sessionId) && !isTemporarySessionId(sessionId),
+      ) || null;
 
     if (!targetSessionId) {
       console.warn('Abort requested but no concrete session ID is available yet.');
@@ -976,7 +1490,7 @@ export function useChatComposerState({
       sessionId: targetSessionId,
       provider,
     });
-  }, [canAbortSession, currentSessionId, pendingViewSessionRef, provider, selectedSession?.id, sendMessage]);
+  }, [canAbortSession, getConcreteSessionIdCandidates, provider, sendMessage]);
 
   const handleTranscript = useCallback((text: string) => {
     if (IS_CODEX_ONLY_HARDENED) {
@@ -1067,6 +1581,7 @@ export function useChatComposerState({
     isTextareaExpanded,
     thinkingMode,
     setThinkingMode,
+    queuedCodexFollowUpCount,
     slashCommandsCount,
     filteredCommands,
     frequentCommands,
@@ -1083,12 +1598,15 @@ export function useChatComposerState({
     selectFile,
     attachedImages,
     setAttachedImages,
+    attachedFiles,
+    setAttachedFiles,
     uploadingImages,
     imageErrors,
+    fileErrors,
     getRootProps,
     getInputProps,
     isDragActive,
-    openImagePicker: open,
+    openAttachmentPicker: open,
     handleSubmit,
     handleInputChange,
     handleKeyDown,
@@ -1096,8 +1614,8 @@ export function useChatComposerState({
     handleTextareaClick,
     handleTextareaInput,
     syncInputOverlayScroll,
-    handleInsertSupplementBlock,
     handleClearInput,
+    handleRemoveQueuedCodexFollowUp,
     handleAbortSession,
     handleTranscript,
     handlePermissionDecision,

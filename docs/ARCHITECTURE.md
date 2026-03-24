@@ -145,12 +145,15 @@ To make "phone and desktop stay in sync when either side opens the finished sess
 
 - the unread-completed state is stored in `session_notifications`
 - the backend writes unread state when a session finishes
-- any device can clear it through `/api/session-notifications/read`
+- Codex CLI open/resume/continue actions do not consume unread state; CLI only produces completion events
+- only a foreground Web view that has actually opened and rendered the session can clear it through `/api/session-notifications/read`
+- when unread state is read back, the server filters it against currently discoverable sessions and prunes stale orphan `session_id` rows
 - the server then broadcasts `session-notifications-state` over WebSocket so every connected client updates together
 
 This keeps the split intentional:
 
 - red unread state is cross-device and durable
+- Web clients share one read result, while background tabs and CLI do not clear it accidentally
 - green processing state stays lightweight and realtime
 - no extra device heartbeat system is required just to keep unread badges consistent
 

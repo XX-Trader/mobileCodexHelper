@@ -6,6 +6,7 @@ import { spawn } from 'child_process';
 
 const router = express.Router();
 const SUPPORTED_PREFERRED_LANGUAGES = new Set(['en', 'ko', 'zh-CN', 'ja', 'ru']);
+const CODEX_ONLY_HARDENED_MODE = process.env.CODEX_ONLY_HARDENED_MODE !== 'false';
 
 function spawnAsync(command, args, options = {}) {
   return new Promise((resolve, reject) => {
@@ -26,7 +27,17 @@ function spawnAsync(command, args, options = {}) {
   });
 }
 
+function rejectDisabledUserRoute(res, featureName) {
+  return res.status(403).json({
+    error: `${featureName} is disabled in Codex-only hardened mode`,
+  });
+}
+
 router.get('/git-config', authenticateToken, async (req, res) => {
+  if (CODEX_ONLY_HARDENED_MODE) {
+    return rejectDisabledUserRoute(res, 'Git configuration');
+  }
+
   try {
     const userId = req.user.id;
     let gitConfig = userDb.getGitConfig(userId);
@@ -56,6 +67,10 @@ router.get('/git-config', authenticateToken, async (req, res) => {
 
 // Apply git config globally via git config --global
 router.post('/git-config', authenticateToken, async (req, res) => {
+  if (CODEX_ONLY_HARDENED_MODE) {
+    return rejectDisabledUserRoute(res, 'Git configuration');
+  }
+
   try {
     const userId = req.user.id;
     const { gitName, gitEmail } = req.body;

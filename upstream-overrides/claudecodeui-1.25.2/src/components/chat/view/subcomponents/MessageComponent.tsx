@@ -1,7 +1,8 @@
-import { memo, useEffect, useMemo, useRef, useState } from 'react';
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import SessionProviderLogo from '../../../llm-logo-provider/SessionProviderLogo';
 import type {
+  ChatAttachment,
   ChatMessage,
   ClaudePermissionSuggestion,
   PermissionGrantResult,
@@ -13,6 +14,8 @@ import type { Project } from '../../../../types/app';
 import { ToolRenderer, shouldHideToolResult } from '../../tools';
 import { Markdown } from './Markdown';
 import MessageCopyControl from './MessageCopyControl';
+import { downloadChatAttachment, fetchChatAttachmentBlob } from '../../../../utils/api';
+import { formatChatAttachmentSize } from '../../utils/chatAttachments';
 
 type DiffLine = {
   type: string;
@@ -27,11 +30,13 @@ type MessageComponentProps = {
   onFileOpen?: (filePath: string, diffInfo?: unknown) => void;
   onShowSettings?: () => void;
   onGrantToolPermission?: (suggestion: ClaudePermissionSuggestion) => PermissionGrantResult | null | undefined;
+  onRemoveQueuedMessage?: (queueId: string) => void;
   autoExpandTools?: boolean;
   showRawParameters?: boolean;
   showThinking?: boolean;
   selectedProject?: Project | null;
   provider: Provider | string;
+  onOpenAttachment?: (attachment: ChatAttachment) => void;
 };
 
 type InteractiveOption = {
@@ -43,7 +48,78 @@ type InteractiveOption = {
 type PermissionGrantState = 'idle' | 'granted' | 'error';
 const COPY_HIDDEN_TOOL_NAMES = new Set(['Bash', 'Edit', 'Write', 'ApplyPatch']);
 
-const MessageComponent = memo(({ message, prevMessage, createDiff, onFileOpen, onShowSettings, onGrantToolPermission, autoExpandTools, showRawParameters, showThinking, selectedProject, provider }: MessageComponentProps) => {
+type ProtectedAttachmentImageProps = {
+  attachment: ChatAttachment;
+  projectName: string;
+  alt: string;
+  className?: string;
+  onClick?: () => void;
+};
+
+function ProtectedAttachmentImage({
+  attachment,
+  projectName,
+  alt,
+  className,
+  onClick,
+}: ProtectedAttachmentImageProps) {
+  const [imageUrl, setImageUrl] = useState<string>('');
+  const [loadError, setLoadError] = useState<string>('');
+
+  useEffect(() => {
+    let isActive = true;
+    let objectUrl = '';
+
+    const loadImage = async () => {
+      try {
+        setLoadError('');
+        const { blob } = await fetchChatAttachmentBlob(projectName, attachment);
+        if (!isActive) {
+          return;
+        }
+
+        objectUrl = window.URL.createObjectURL(blob);
+        setImageUrl(objectUrl);
+      } catch (error) {
+        console.error('Failed to load protected chat attachment image:', error);
+        if (isActive) {
+          setLoadError(error instanceof Error ? error.message : 'Failed to load image');
+        }
+      }
+    };
+
+    void loadImage();
+
+    return () => {
+      isActive = false;
+      if (objectUrl) {
+        window.URL.revokeObjectURL(objectUrl);
+      }
+    };
+  }, [attachment.contentUrl, attachment.path, attachment.previewUrl, projectName]);
+
+  if (imageUrl) {
+    return (
+      <img
+        src={imageUrl}
+        alt={alt}
+        className={className}
+        onClick={onClick}
+      />
+    );
+  }
+
+  return (
+    <div
+      className={`flex min-h-[120px] items-center justify-center rounded-lg border border-white/15 bg-white/10 px-3 py-2 text-center text-xs text-blue-100/80 ${className || ''}`}
+      role="status"
+    >
+      {loadError || 'Loading image...'}
+    </div>
+  );
+}
+
+const MessageComponent = memo(({ message, prevMessage, createDiff, onFileOpen, onShowSettings, onGrantToolPermission, onRemoveQueuedMessage, autoExpandTools, showRawParameters, showThinking, selectedProject, provider, onOpenAttachment }: MessageComponentProps) => {
   const { t } = useTranslation('chat');
   const isGrouped = !message.isCommandGroup && !prevMessage?.isCommandGroup && prevMessage && prevMessage.type === message.type &&
     ((prevMessage.type === 'assistant') ||
@@ -71,12 +147,24 @@ const MessageComponent = memo(({ message, prevMessage, createDiff, onFileOpen, o
   const shouldShowAssistantCopyControl = message.type === 'assistant' &&
     assistantCopyContent.trim().length > 0 &&
     !isCommandOrFileEditToolResponse;
+  const isQueuedUserMessage = message.type === 'user' && Boolean(message.isQueued);
+  const queuedFollowUpId =
+    typeof message.queuedFollowUpId === 'string' ? message.queuedFollowUpId : null;
   const userMessageLineCount = useMemo(
     () => userCopyContent.split(/\r?\n/).length,
     [userCopyContent],
   );
   const shouldCollapseUserMessage = message.type === 'user' &&
     (userCopyContent.length > 280 || userMessageLineCount > 8);
+  const messageAttachments = Array.isArray(message.attachments)
+    ? (message.attachments as ChatAttachment[])
+    : [];
+  const previewableImageAttachments = messageAttachments.filter(
+    (attachment) =>
+      attachment.kind === 'image' &&
+      Boolean(attachment.contentUrl || attachment.previewUrl || attachment.path),
+  );
+  const fileAttachments = messageAttachments.filter((attachment) => attachment.kind === 'file');
 
 
   useEffect(() => {
@@ -86,6 +174,39 @@ const MessageComponent = memo(({ message, prevMessage, createDiff, onFileOpen, o
   useEffect(() => {
     setIsUserMessageExpanded(false);
   }, [message.timestamp]);
+
+  const handleOpenAttachment = useCallback(async (attachment: ChatAttachment) => {
+    if (onOpenAttachment) {
+      onOpenAttachment(attachment);
+      return;
+    }
+
+    if (!selectedProject?.name) {
+      const fallbackTarget = attachment.contentUrl || attachment.previewUrl;
+      if (fallbackTarget) {
+        window.open(fallbackTarget, '_blank', 'noopener,noreferrer');
+      }
+      return;
+    }
+
+    try {
+      const { blob } = await fetchChatAttachmentBlob(selectedProject.name, attachment);
+      const objectUrl = window.URL.createObjectURL(blob);
+      const newWindow = window.open(objectUrl, '_blank', 'noopener,noreferrer');
+
+      if (!newWindow) {
+        window.URL.revokeObjectURL(objectUrl);
+        await downloadChatAttachment(selectedProject.name, attachment);
+        return;
+      }
+
+      window.setTimeout(() => {
+        window.URL.revokeObjectURL(objectUrl);
+      }, 60_000);
+    } catch (error) {
+      console.error('Failed to open protected chat attachment:', error);
+    }
+  }, [onOpenAttachment, selectedProject?.name]);
 
   useEffect(() => {
     const node = messageRef.current;
@@ -166,6 +287,22 @@ const MessageComponent = memo(({ message, prevMessage, createDiff, onFileOpen, o
         /* User message bubble on the right */
         <div className="flex w-full items-end space-x-0 sm:w-auto sm:max-w-[85%] sm:space-x-3 md:max-w-md lg:max-w-lg xl:max-w-xl">
           <div className="group flex-1 rounded-2xl rounded-br-md bg-blue-600 px-3 py-2 text-white shadow-sm sm:flex-initial sm:px-4">
+            {isQueuedUserMessage && (
+              <div className="mb-2 flex items-center justify-end gap-2">
+                <span className="inline-flex items-center rounded-full border border-white/20 bg-white/12 px-2 py-0.5 text-[11px] font-medium tracking-wide text-white/90">
+                  {t('message.queued', { defaultValue: '\u6392\u961f\u4e2d' })}
+                </span>
+                {queuedFollowUpId && onRemoveQueuedMessage && (
+                  <button
+                    type="button"
+                    onClick={() => onRemoveQueuedMessage(queuedFollowUpId)}
+                    className="inline-flex items-center rounded-full border border-white/20 bg-white/10 px-2 py-0.5 text-[11px] font-medium text-white/90 transition-colors hover:bg-white/15"
+                  >
+                    {t('message.removeQueued', { defaultValue: '\u5220\u9664' })}
+                  </button>
+                )}
+              </div>
+            )}
             <div className="relative">
               <div
                 className={`whitespace-pre-wrap break-words text-sm ${
@@ -193,6 +330,50 @@ const MessageComponent = memo(({ message, prevMessage, createDiff, onFileOpen, o
                 ))}
               </div>
             )}
+            {previewableImageAttachments.length > 0 && (
+              <div className="mt-2 grid grid-cols-2 gap-2">
+                {previewableImageAttachments.map((attachment, index) => (
+                  <ProtectedAttachmentImage
+                    key={`${attachment.name}-${index}`}
+                    attachment={attachment}
+                    projectName={selectedProject?.name || ''}
+                    alt={attachment.name}
+                    className="h-auto max-w-full cursor-pointer rounded-lg transition-opacity hover:opacity-90"
+                    onClick={() => void handleOpenAttachment(attachment)}
+                  />
+                ))}
+              </div>
+            )}
+            {fileAttachments.length > 0 && (
+              <div className="mt-2 flex flex-wrap gap-2">
+                {fileAttachments.map((attachment, index) => (
+                  <button
+                    key={`${attachment.path}-${index}`}
+                    type="button"
+                    onClick={() => void handleOpenAttachment(attachment)}
+                    className="flex max-w-full items-center gap-2 rounded-xl border border-white/20 bg-white/10 px-3 py-2 text-left text-white transition-colors hover:bg-white/15"
+                  >
+                    <span className="flex h-7 w-7 flex-shrink-0 items-center justify-center rounded-lg bg-white/10">
+                      <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path
+                          strokeLinecap="round"
+                          strokeLinejoin="round"
+                          strokeWidth={2}
+                          d="M7 7V5a2 2 0 012-2h6l5 5v11a2 2 0 01-2 2H9a2 2 0 01-2-2V7z"
+                        />
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M14 3v6h6" />
+                      </svg>
+                    </span>
+                    <span className="min-w-0">
+                      <span className="block truncate text-sm font-medium">{attachment.name}</span>
+                      <span className="block truncate text-xs text-blue-100/80">
+                        {attachment.size ? formatChatAttachmentSize(attachment.size) : attachment.path}
+                      </span>
+                    </span>
+                  </button>
+                ))}
+              </div>
+            )}
             {shouldCollapseUserMessage && (
               <div className="mt-2 flex justify-end">
                 <button
@@ -201,8 +382,8 @@ const MessageComponent = memo(({ message, prevMessage, createDiff, onFileOpen, o
                   className="rounded-full border border-white/20 bg-white/10 px-2.5 py-1 text-xs font-medium text-white transition-colors hover:bg-white/15"
                 >
                   {isUserMessageExpanded
-                    ? t('message.collapseUser', { defaultValue: '收起' })
-                    : t('message.expandUser', { defaultValue: '展开' })}
+                    ? t('message.collapseUser', { defaultValue: '\u6536\u8d77' })
+                    : t('message.expandUser', { defaultValue: '\u5c55\u5f00' })}
                 </button>
               </div>
             )}

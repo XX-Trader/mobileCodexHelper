@@ -9,10 +9,12 @@ import {
 } from '../../../constants/config';
 import type { PendingPermissionRequest, PermissionMode } from '../types/types';
 import type { Project, ProjectSession, SessionProvider } from '../../../types/app';
+import type { SessionViewChatRuntime } from '../../../types/sessionView';
 
 interface UseChatProviderStateArgs {
   selectedProject: Project | null;
   selectedSession: ProjectSession | null;
+  runtimeSnapshot?: SessionViewChatRuntime | null;
 }
 
 const CODEX_PERMISSION_MODES: PermissionMode[] = ['default', 'acceptEdits', 'bypassPermissions', 'plan'];
@@ -79,7 +81,11 @@ const readSessionScopedValue = (
   return localStorage.getItem(storageKey);
 };
 
-export function useChatProviderState({ selectedProject, selectedSession }: UseChatProviderStateArgs) {
+export function useChatProviderState({
+  selectedProject,
+  selectedSession,
+  runtimeSnapshot,
+}: UseChatProviderStateArgs) {
   const [provider, setProvider] = useState<SessionProvider>(() => {
     if (IS_CODEX_ONLY_HARDENED) {
       return 'codex';
@@ -105,6 +111,11 @@ export function useChatProviderState({ selectedProject, selectedSession }: UseCh
   });
 
   const lastProviderRef = useRef(provider);
+  const runtimeSnapshotRef = useRef(runtimeSnapshot);
+
+  useEffect(() => {
+    runtimeSnapshotRef.current = runtimeSnapshot;
+  }, [runtimeSnapshot]);
 
   useEffect(() => {
     const sessionProvider = selectedSession?.__provider || provider;
@@ -183,6 +194,26 @@ export function useChatProviderState({ selectedProject, selectedSession }: UseCh
       previous.filter((request) => !request.sessionId || request.sessionId === selectedSession?.id),
     );
   }, [selectedSession?.id]);
+
+  useEffect(() => {
+    if (!selectedSession?.id) {
+      setPendingPermissionRequests([]);
+      return;
+    }
+
+    const nextPendingPermissionRequests = (runtimeSnapshotRef.current?.pendingPermissionRequests || []).map((request) => ({
+      requestId: request.requestId,
+      toolName: request.toolName,
+      input: request.input,
+      context: request.context,
+      sessionId:
+        typeof request.sessionId === 'string' || request.sessionId === null
+          ? request.sessionId
+          : undefined,
+      receivedAt: request.receivedAt ? new Date(request.receivedAt) : undefined,
+    }));
+    setPendingPermissionRequests(nextPendingPermissionRequests);
+  }, [runtimeSnapshot?.updatedAt, selectedProject?.name, selectedSession?.__provider, selectedSession?.id]);
 
   useEffect(() => {
     if (IS_CODEX_ONLY_HARDENED || provider !== 'cursor') {
